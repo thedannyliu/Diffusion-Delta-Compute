@@ -40,16 +40,8 @@
 conda create -y -n dcllm python=3.10
 conda activate dcllm
 
-# Core
-pip install torch==2.2.* --index-url https://download.pytorch.org/whl/cu121
-pip install transformers datasets accelerate einops bitsandbytes
-pip install sentencepiece tiktoken
-
-# Metrics / viz / logging
-pip install wandb evaluate scikit-learn matplotlib seaborn plotly
-
-# Profiling (optional)
-pip install thop fvcore torchprofile
+# Install
+pip install -r requirements.txt
 ```
 
 **Cluster prerequisites**
@@ -111,7 +103,7 @@ We keep **three tiers** for quick iteration:
 
 3) **Stretch**: full GSM8K dev; larger MMLU slice.
 
-> All datasets read via `datasets` hub; subsampling controlled in `configs/tasks.yaml`.
+> All datasets read via `datasets` hub; subsampling controlled in `configs/tasks.yaml`. For PoC we prioritize: **Wikitext‑2 PPL**, **LAMBADA‑open acc**, **Tiny GSM8K EM**.
 
 ---
 
@@ -155,6 +147,8 @@ class DiffusionEngine(BaseEngine):
 
 **Deliverable**: `reports/runs/<date>_teacher.jsonl` (aggregates) + figure set.
 
+**Performance logging**: record wall‑clock per‑sequence latency (batch=1), throughput (seq/s at batch=4–8), and GPU utilization snapshot per run.
+
 ---
 
 ## 8. P2 — Rule‑based Gating (Baseline)
@@ -171,7 +165,7 @@ class DiffusionEngine(BaseEngine):
 4. Log savings (skipped layer/token counts) & quality.
 
 **Outputs**
-- FLOPs‑saved vs quality curves; latency reduction; failure cases (where unfreeze triggers often).
+- FLOPs‑saved vs quality curves; latency reduction; failure cases (where unfreeze triggers often). Track skipped (token×layer×step) ratio.
 
 ---
 
@@ -190,6 +184,10 @@ class DiffusionEngine(BaseEngine):
 **Training**
 - Split by prompts; early‑stop on AUROC@dev; class‑imbalance by focal loss or pos_weight。  
 - Export TorchScript to keep inference overhead negligible.
+
+**Internal consistency checks**
+- Final tokens consistency (Teacher vs wrapper with no skipping) should be 100%.
+- Step‑wise KL / entropy trends must match Teacher traces.
 
 ---
 
@@ -240,20 +238,25 @@ module load cuda/12.1 anaconda
 source activate dcllm
 export WANDB_MODE=online
 
-srun bash scripts/run_teacher.sh \
-  --task_set smoke \
-  --model d2f-small \
-  --max_new_tokens 128 \
-  --save_traces
+srun bash scripts/run_teacher.sh reports
 ```
 
 **run script (example)** — `scripts/run_teacher.sh`
 ```bash
 python -m src.run \
   --mode teacher \
-  --engine d2f \
-  --config configs/tasks.yaml \
-  --out_dir reports/runs/$(date +%Y%m%d_%H%M)
+  --engine mock \
+  --out_dir reports
+```
+
+**rule gate run** — `scripts/run_rule_gate.sh`
+```bash
+python -m src.run \
+  --mode rule_gate \
+  --engine mock \
+  --out_dir reports \
+  --tau 0.95 --rho 0.10 --m 2 --freeze_K 2 \
+  --watchdog_min_cos 0.90 --watchdog_max_kl 0.02
 ```
 
 ---
