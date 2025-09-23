@@ -1,0 +1,12 @@
+phase: P3
+engine: d2f
+task: wikitext
+num_prompts: 16
+max_new_tokens: 128
+num_steps: 12
+exp_name: wikitext_learned_gate
+learned_gate_freeze_K: 2
+learned_gate_min_consecutive: 1
+watchdog:
+  min_cos: 0.90
+  max_kl: 0.02

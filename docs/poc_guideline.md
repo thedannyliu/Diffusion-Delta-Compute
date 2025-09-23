@@ -13,29 +13,38 @@ pip install -r requirements.txt
 ```
 
 注意：若要使用 GPU 版 torch，請依機器環境替換 torch 版本／索引來源（例如 PyTorch 官方 CUDA whl）。
+- 路徑設定：`configs/paths.yaml` 控制 `data_root` / `models_root` / `outputs_root`，預設值與 `scripts/download_data_and_model.sh` 下載結果一致，可依實際機器調整。
 
 ### 1. 倉庫結構（重點）
 - `src/engine/`: 引擎抽象與實作（`base_engine.py`, `mock_engine.py`, `d2f_engine.py`）。
 - `src/probes/`: 量測指標（cosine、ΔL2、KL、entropy、margin）。
-- `src/gating/`: Gate 模組（P2 規則式）。
+- `src/gating/`: Gate 模組（含 `rule_gate.py`, `learned_gate.py`）。
+- `src/learned/train_gate.py`: 輕量 gate 的訓練腳本（Logistic/MLP）。
 - `src/eval/`: 資料集載入與評分器（Wikitext‑2、LAMBADA、GSM8K）。
 - `src/viz/`: 圖表輸出（無 matplotlib 時降級為 .npy/.csv）。
-- `src/run.py`: 入口點，支援 `teacher` 與 `rule_gate` 模式。
-- `configs/`: 門檻與任務設定樣例。
-- `scripts/`: 快速腳本與 Slurm 模版。
+- `src/run.py`: 單一入口點，支援 `teacher` / `rule_gate` / `learned_gate` 模式。
+- `configs/`: 任務與門檻設定（新增 `p1_smoke.yaml`, `p2_smoke.yaml`, `p3_smoke.yaml` 與路徑檔 `paths.yaml`）。
+- `scripts/`: 快速腳本 (`run_p1_teacher.sh`, `run_p2_rule_gate.sh`, `run_p3_learned_gate.sh`) 以及 Slurm 模版。
 
 ### 2. P1 — Teacher 路徑量測與可視化
 目的：在不跳算的情況下，記錄各步之間（step t 與 t-1）的表徵變化，用以理解「穩定度」與後續 Gate 的依據。
 
-指令（小型 Smoke 測試）：
+指令（建議使用腳本，預設讀取 `configs/p1_smoke.yaml` 並沿用 `configs/paths.yaml`）：
 ```bash
-python -m src.run --mode teacher --engine mock --out_dir reports \
-  --num_prompts 16 --max_new_tokens 128 --num_steps 12
+# Mock 引擎快速檢查（不需 torch）
+ENGINE=mock scripts/run_p1_teacher.sh
+
+# d2f 真實模型（需先用 scripts/download_data_and_model.sh 下載權重與資料）
+scripts/run_p1_teacher.sh
+
+# 亦可指定自訂 YAML 或額外參數
+scripts/run_p1_teacher.sh path/to/custom.yaml --num_prompts 32
 ```
 
 輸出：
-- `reports/<run>/runs/teacher_*.jsonl`：每步的 cosine/ΔL2/KL/entropy/margin 平均值。
-- `reports/<run>/figures/*`：熱圖或直方圖（若無 matplotlib，輸出 .npy/.csv）。
+- `reports/P1/teacher/<engine>/<exp_name>/runs/teacher_*.jsonl`：每步的 cosine/ΔL2/KL/entropy/margin 平均值。
+- `reports/.../figures/*`：熱圖或直方圖（若無 matplotlib，輸出 .npy/.csv）。
+- `reports/.../features/teacher_features_*.npz`：token-level 特徵與啟發式標籤（供 P3 訓練使用），腳本結束時會印出實際路徑。
 
 檢查：
 - Cosine 遞增（越接近 1）或 ΔL2 遞減的趨勢。
@@ -50,20 +59,19 @@ python -m src.run --mode teacher --engine mock --out_dir reports \
 
 指令：
 ```bash
-python -m src.run --mode rule_gate --engine mock --out_dir reports \
-  --num_prompts 16 --max_new_tokens 128 --num_steps 12 \
-  --tau 0.95 --rho 0.10 --m 2 --freeze_K 2 \
-  --watchdog_min_cos 0.90 --watchdog_max_kl 0.02
+scripts/run_p2_rule_gate.sh            # 預設讀取 configs/p2_smoke.yaml
+# 或切換成 mock 引擎
+ENGINE=mock scripts/run_p2_rule_gate.sh
 ```
 
 輸出：
-- `savings` 直方圖：顯示已跳過（token×step）比例。
-- 後續可擴充：記錄 per-layer 跳過次數，形成（token×layer×step）比例。
+- `reports/P2/rule_gate/<engine>/<exp_name>/runs/rule_gate_*.jsonl`：每個 prompt 的節省比例與統計。
+- `reports/.../figures/rule_gate_savings_hist_*.png`：跳算比例直方圖；`runs/rule_gate_summary_*.json` 含 latency/throughput 等指標。
 
 效能數據（建議記錄）：
 - `Wall-clock latency`（ms/句子，batch=1）。
 - `Throughput`（seq/s，batch=4–8）。
-- `已跳過比例`（token×layer×step）（P2 後持續記錄）。
+- `已跳過比例`（token×layer×step；summary JSON 的 `skip_ratio_mean`）。
 - `GPU 利用率`（以 `nvidia-smi` 輕量查詢）。
 
 ### 4. 真實引擎：d2f-dream 整合
@@ -86,6 +94,17 @@ python -m src.run --mode rule_gate --engine mock --out_dir reports \
 部署（線上）：
 - 以批次特徵丟入 gate，得到每 token 的 `p_freeze` 與長度，更新 `compute_mask` 供引擎在下一步使用。
 - 維持 watchdog 機制以避免品質劣化。
+
+部署流程（半自動化）：
+1. 先執行 `scripts/run_p1_teacher.sh` 產生最新的 `teacher_features_*.npz`（或指定自訂 config）。
+2. 使用 `scripts/run_p3_learned_gate.sh [features_glob] [config_yaml]` 進行 gate 訓練與評測：
+   - 預設會尋找最近一次 P1 輸出的 feature 檔案，並將權重存成 `models/gates/learned_gate_latest.npz`。
+   - 可透過環境變數調整，例如 `WEIGHTS_OUT`（輸出路徑）、`TRAIN_EPOCHS`、`TRAIN_BATCH`、`TRAIN_LR`、`TRAIN_THRESHOLD_GRID`。
+   - 若 Feature 檔案不在預設位置，可將第一個參數指定為 glob pattern（例：`scripts/run_p3_learned_gate.sh "reports/P1/**/teacher_features_*.npz"`）。
+
+輸出：
+- 權重：`models/gates/learned_gate_latest.npz`（或 `WEIGHTS_OUT` 自訂路徑），內含 logistic 係數、標準化統計與最佳 threshold。
+- 評測：`reports/P3/learned_gate/<engine>/<exp_name>/...`，含 latency/throughput/skip ratio 與機率分佈圖。
 
 預期成果：
 - 三類任務（Wikitext‑2 PPL、LAMBADA acc、Tiny GSM8K EM）上的 `質-速` 曲線：在 ≥1.5× 加速下，品質衰減在容忍範圍（例如 PPL +≤3%、acc/EM 降幅 ≤1%）。
@@ -117,5 +136,4 @@ GSM8K（Tiny）：
 - 避免過度凍結導致錯誤累積：啟用 watchdog 與週期性重算（K/M）。
 - 對注意力中心度高的 token 可降低凍結概率（可在 learned gate 納入 attn 特徵）。
 - 保持 Gate 計算開銷 < 3% 總延遲（向量化實作，避免 Python per-token 迴圈）。
-
 

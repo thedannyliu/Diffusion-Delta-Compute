@@ -21,6 +21,7 @@ class RuleGateConfig:
 class StepGateResult:
     compute_mask: Optional[np.ndarray]
     counters: np.ndarray
+    probabilities: Optional[np.ndarray] = None
 
 
 class RuleGate:
@@ -52,6 +53,7 @@ class RuleGate:
         entropy: np.ndarray,
         margin: np.ndarray,
         num_tokens: int,
+        compute_mask: Optional[np.ndarray] = None,
     ) -> StepGateResult:
         self._ensure_state(num_tokens)
         counters = self._counters
@@ -59,20 +61,26 @@ class RuleGate:
 
         stable = (feats_cos >= self.cfg.cosine_tau) | (feats_dl2 <= self.cfg.delta_l2_rho)
 
-        not_frozen = cooldown <= 0
-        counters[not_frozen & stable] += 1
-        counters[not_frozen & (~stable)] = 0
+        if compute_mask is None:
+            active = np.ones_like(stable, dtype=bool)
+        else:
+            active = compute_mask.astype(bool)
 
-        start_freeze = (counters >= self.cfg.consecutive_m) & (cooldown <= 0)
+        not_frozen = cooldown <= 0
+        update_mask = active & not_frozen
+
+        counters[update_mask & stable] += 1
+        counters[update_mask & (~stable)] = 0
+
+        start_freeze = (counters >= self.cfg.consecutive_m) & (cooldown <= 0) & active
         cooldown[start_freeze] = self.cfg.freeze_K
 
         # Decrement cooldown at end of step
         freezing_now = cooldown > 0
         cooldown[freezing_now] -= 1
+        cooldown[cooldown < 0] = 0
 
-        compute_mask = (cooldown <= 0)
+        compute_mask_next = (cooldown <= 0)
         self._counters = counters
         self._cooldown = cooldown
-        return StepGateResult(compute_mask=compute_mask, counters=counters.copy())
-
-
+        return StepGateResult(compute_mask=compute_mask_next, counters=counters.copy())

@@ -3,6 +3,9 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 import numpy as np
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from peft import PeftModel
 
 from .base_engine import BaseEngine, EngineState, StepOutputs
 
@@ -14,64 +17,66 @@ class D2FDreamEngine(BaseEngine):
     If the package is not installed, an ImportError will be raised.
     """
 
-    def __init__(self, model_name: str = "d2f-small", device: str = "cuda", model_path: Optional[str] = None, lora_path: Optional[str] = None, use_lora: bool = False) -> None:
-        try:
-            # Placeholder import paths – update to actual package as needed.
-            import d2f_dream as d2f  # type: ignore
-        except Exception as e:
-            raise ImportError(
-                "d2f-dream is not installed. Please install the engine and set PYTHONPATH or use requirements.txt instructions."
-            ) from e
-
-        self._d2f = d2f
-        self._device = device
-        # Construct model/engine according to d2f API (pseudo-code)
-        # self._engine = d2f.load_engine(model_name=model_name, device=device)
-        # For PoC placeholder, we just store name
+    def __init__(self, model_name: str = "d2f-small", device: str = "cuda", model_path: Optional[str] = None, lora_path: Optional[str] = None, use_lora: bool = False, num_steps: int = 12, max_seq_len: int = 128) -> None:
+        self._device = device if torch.cuda.is_available() and device.startswith("cuda") else "cpu"
         self._model_name = model_name
         self._model_path = model_path
         self._lora_path = lora_path
         self._use_lora = use_lora
-        self._num_steps = 12
-        self._vocab_size = 32000
-        self._hidden_size = 1024
-        self._num_layers = 24
-        self._seq_len = 128
+        self._num_steps = num_steps
+        self._seq_len = max_seq_len
+
+        # Load tokenizer and model from local snapshot
+        model_load_path = self._model_path if self._model_path else "Dream-org/Dream-v0-Instruct-7B"
+        self._tokenizer = AutoTokenizer.from_pretrained(model_load_path, trust_remote_code=True)
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_load_path,
+            device_map="auto" if self._device != "cpu" else None,
+            torch_dtype="auto",
+            trust_remote_code=True,
+        )
+        if self._use_lora and self._lora_path:
+            peft_model = PeftModel.from_pretrained(base_model, self._lora_path)
+            try:
+                base_model = peft_model.merge_and_unload()
+            except Exception:
+                base_model = peft_model
+        self._model = base_model.eval()
 
     def encode_prompt(self, prompt: str) -> EngineState:
         rng = np.random.default_rng(1234 + hash(prompt) % 10000)
         return EngineState(prompt=prompt, step_index=0, rng=rng)
 
     def step(self, state: EngineState, t: int, compute_mask: Optional[np.ndarray] = None) -> StepOutputs:
-        # TODO: Replace with calls into real d2f engine per-step API with compute_mask support
-        # For now, use a deterministic placeholder evolution so the harness runs end-to-end.
-        rng = state.rng
-        if state.prev_hidden_by_layer is None:
-            hidden_by_layer = [
-                rng.normal(0.0, 1.0, size=(self._seq_len, self._hidden_size)).astype(np.float32)
-                for _ in range(self._num_layers)
-            ]
-        else:
-            hidden_by_layer = [h.copy() for h in state.prev_hidden_by_layer]
-            noise = [rng.normal(0.0, 0.1, size=h.shape).astype(np.float32) for h in hidden_by_layer]
-            hidden_by_layer = [h + n for h, n in zip(hidden_by_layer, noise)]
-            if compute_mask is not None:
-                mask = compute_mask.astype(bool)
-                hidden_by_layer = [np.where(mask[:, None], h, state.prev_hidden_by_layer[i]) for i, h in enumerate(hidden_by_layer)]
+        inputs = self._tokenizer(state.prompt, return_tensors="pt", truncation=True, max_length=self._seq_len)
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        with torch.no_grad():
+            out = self._model(**inputs, output_hidden_states=True)
+        logits_t = out.logits[0].detach().cpu().float().numpy()  # [seq, vocab]
+        hidden_states = out.hidden_states  # tuple len L+1 (incl embeddings)
+        layers = []
+        for h in hidden_states[1:]:  # skip embeddings
+            layers.append(h[0].detach().cpu().float().numpy())  # [seq, hidden]
 
-        # Simple logits projection for placeholder
-        W = np.random.default_rng(2024).normal(0.0, 0.1, size=(self._hidden_size, self._vocab_size)).astype(np.float32)
-        pooled = sum(hidden_by_layer) / float(len(hidden_by_layer))
-        logits = pooled @ W
+        # Apply per-token freeze by reusing previous step values where compute_mask is False
+        if compute_mask is not None and state.prev_hidden_by_layer is not None and state.prev_logits is not None:
+            mask = compute_mask.astype(bool)
+            for li in range(len(layers)):
+                prev_layer = state.prev_hidden_by_layer[li]
+                cur_layer = layers[li]
+                cur_layer[~mask] = prev_layer[~mask]
+                layers[li] = cur_layer
+            logits_prev = state.prev_logits
+            logits_t[~mask] = logits_prev[~mask]
 
-        state.prev_hidden_by_layer = [h.copy() for h in hidden_by_layer]
-        state.prev_logits = logits.copy()
+        state.prev_hidden_by_layer = [h.copy() for h in layers]
+        state.prev_logits = logits_t.copy()
         state.step_index = t
 
-        return StepOutputs(hidden_by_layer=hidden_by_layer, logits=logits, attn_stats=None, aux={})
+        return StepOutputs(hidden_by_layer=layers, logits=logits_t, attn_stats=None, aux={})
 
     def decode(self, state: EngineState) -> str:
-        return "<decoded text>"
+        return state.prompt
 
     def num_steps(self) -> int:
         return self._num_steps
