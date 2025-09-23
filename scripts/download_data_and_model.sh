@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# 確保 conda 指令可用
 if command -v conda &>/dev/null; then
   eval "$(conda shell.bash hook)"
   conda activate dcllm
@@ -20,7 +19,6 @@ CKPT_ROOT="$MODELS_ROOT/checkpoints"
 LORA_ROOT="$MODELS_ROOT/lora"
 
 # === Hugging Face caches ===
-# 優先沿用你現有的環境變數；若未設，再給與你目前機器一致的預設值。
 export HF_HOME=${HF_HOME:-/storage/ice1/2/9/eliu354/hf_cache}
 export HF_DATASETS_CACHE=${HF_DATASETS_CACHE:-$HF_HOME/datasets}
 export TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-$HF_HOME}
