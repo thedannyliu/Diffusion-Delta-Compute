@@ -3,6 +3,9 @@ set -euo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
+ENV_FEATURE_SOURCE=${FEATURE_SOURCE:-}
+ENV_CONFIG_PATH=${CONFIG_PATH:-}
+
 FEATURE_SOURCE=""
 CONFIG_PATH=""
 
@@ -14,7 +17,17 @@ fi
 if [[ $# -gt 0 ]]; then
   CONFIG_PATH=$1
   shift
-else
+fi
+
+if [[ -z "$FEATURE_SOURCE" && -n "$ENV_FEATURE_SOURCE" ]]; then
+  FEATURE_SOURCE="$ENV_FEATURE_SOURCE"
+fi
+
+if [[ -z "$CONFIG_PATH" && -n "$ENV_CONFIG_PATH" ]]; then
+  CONFIG_PATH="$ENV_CONFIG_PATH"
+fi
+
+if [[ -z "$CONFIG_PATH" ]]; then
   CONFIG_PATH="$PROJECT_ROOT/configs/p3_smoke.yaml"
 fi
 

@@ -14,6 +14,7 @@ pip install -r requirements.txt
 
 注意：若要使用 GPU 版 torch，請依機器環境替換 torch 版本／索引來源（例如 PyTorch 官方 CUDA whl）。
 - 路徑設定：`configs/paths.yaml` 控制 `data_root` / `models_root` / `outputs_root`，預設值與 `scripts/download_data_and_model.sh` 下載結果一致，可依實際機器調整。
+- 模型下載：`scripts/download_data_and_model.sh` 預設僅同步 Dream base 權重；若要加入 LoRA，請在執行前設定 `D2F_LORA_ID` 並在 config 中開啟 `use_d2f_lora`。
 
 ### 1. 倉庫結構（重點）
 - `src/engine/`: 引擎抽象與實作（`base_engine.py`, `mock_engine.py`, `d2f_engine.py`）。
@@ -29,16 +30,14 @@ pip install -r requirements.txt
 ### 2. P1 — Teacher 路徑量測與可視化
 目的：在不跳算的情況下，記錄各步之間（step t 與 t-1）的表徵變化，用以理解「穩定度」與後續 Gate 的依據。
 
-指令（建議使用腳本，預設讀取 `configs/p1_smoke.yaml` 並沿用 `configs/paths.yaml`）：
+指令（HPC：透過 `sbatch` 提交，預設讀取 `configs/p1_smoke.yaml` 並沿用 `configs/paths.yaml`）：
 ```bash
-# Mock 引擎快速檢查（不需 torch）
-ENGINE=mock scripts/run_p1_teacher.sh
+# P1 teacher traces（Dream base 權重，預設使用 1×H100）
+sbatch scripts/sbatch_teacher.sbatch
 
-# d2f 真實模型（需先用 scripts/download_data_and_model.sh 下載權重與資料）
-scripts/run_p1_teacher.sh
-
-# 亦可指定自訂 YAML 或額外參數
-scripts/run_p1_teacher.sh path/to/custom.yaml --num_prompts 32
+# 範例：改成 mock 引擎或自訂 config / 輸出位置
+ENGINE=mock OUT_DIR=/scratch/$USER/reports sbatch scripts/sbatch_teacher.sbatch
+CONFIG_PATH=configs/my_run.yaml sbatch scripts/sbatch_teacher.sbatch
 ```
 
 輸出：
@@ -57,11 +56,13 @@ scripts/run_p1_teacher.sh path/to/custom.yaml --num_prompts 32
 ### 3. P2 — 規則式凍結（Rule-based Gating）
 規則：若 `(cos ≥ τ) 或 (ΔL2 ≤ ρ)` 且連續滿足 `m` 步，則凍結該 token `K` 步；每步更新看守（watchdog），若 `(cos < 0.90) 或 (KL > 0.02)`，立即解除凍結並重算。
 
-指令：
+指令（HPC 提交）：
 ```bash
-scripts/run_p2_rule_gate.sh            # 預設讀取 configs/p2_smoke.yaml
-# 或切換成 mock 引擎
-ENGINE=mock scripts/run_p2_rule_gate.sh
+# Dream base（無 LoRA）
+sbatch scripts/sbatch_rule_gate.sbatch
+
+# 範例：mock 引擎 smoke 測試
+ENGINE=mock sbatch scripts/sbatch_rule_gate.sbatch
 ```
 
 輸出：
@@ -96,11 +97,11 @@ ENGINE=mock scripts/run_p2_rule_gate.sh
 - 維持 watchdog 機制以避免品質劣化。
 
 部署流程（半自動化）：
-1. 先執行 `scripts/run_p1_teacher.sh` 產生最新的 `teacher_features_*.npz`（或指定自訂 config）。
-2. 使用 `scripts/run_p3_learned_gate.sh [features_glob] [config_yaml]` 進行 gate 訓練與評測：
+1. 先以 `sbatch scripts/sbatch_teacher.sbatch` 產生最新的 `teacher_features_*.npz`（或設定 `CONFIG_PATH` 指向自訂 YAML）。
+2. 使用 `sbatch scripts/sbatch_learned_gate.sbatch` 進行 gate 訓練與評測（可用 `FEATURE_SOURCE` 指定 feature 檔 glob，或預設自動抓最新 P1 輸出）：
    - 預設會尋找最近一次 P1 輸出的 feature 檔案，並將權重存成 `models/gates/learned_gate_latest.npz`。
    - 可透過環境變數調整，例如 `WEIGHTS_OUT`（輸出路徑）、`TRAIN_EPOCHS`、`TRAIN_BATCH`、`TRAIN_LR`、`TRAIN_THRESHOLD_GRID`。
-   - 若 Feature 檔案不在預設位置，可將第一個參數指定為 glob pattern（例：`scripts/run_p3_learned_gate.sh "reports/P1/**/teacher_features_*.npz"`）。
+   - 若 Feature 檔案不在預設位置，可設定 `FEATURE_SOURCE="reports/P1/**/teacher_features_*.npz"` 後再提交。
 
 輸出：
 - 權重：`models/gates/learned_gate_latest.npz`（或 `WEIGHTS_OUT` 自訂路徑），內含 logistic 係數、標準化統計與最佳 threshold。

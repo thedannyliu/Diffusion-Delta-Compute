@@ -6,6 +6,7 @@ max_new_tokens: 128
 num_steps: 12
 exp_name: wikitext_smoke
 dump_features_dir: features
+use_d2f_lora: false
 label_thresholds:
   cosine_tau: 0.97
   delta_l2_rho: 0.05

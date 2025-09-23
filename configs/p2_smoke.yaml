@@ -10,6 +10,7 @@ rho: 0.10
 m: 2
 freeze_K: 2
 layer_recompute_M: 2
+use_d2f_lora: false
 watchdog:
   min_cos: 0.90
   max_kl: 0.02
