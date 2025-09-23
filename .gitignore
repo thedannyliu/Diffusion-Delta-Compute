@@ -23,6 +23,9 @@ env/
 /models/
 /reports/
 /logs/
+models/
+reports/
+logs/
 
 # Notebooks
 .ipynb_checkpoints/
