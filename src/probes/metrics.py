@@ -20,8 +20,8 @@ def cosine_similarity_tokens(h_now_layers: List[np.ndarray], h_prev_layers: List
     seq_len = h_now_layers[0].shape[0]
     cos_sum = np.zeros((seq_len,), dtype=np.float32)
     for li in range(num_layers):
-        a = h_now_layers[li]
-        b = h_prev_layers[li]
+        a = np.ascontiguousarray(h_now_layers[li]).copy()
+        b = np.ascontiguousarray(h_prev_layers[li]).copy()
         num = np.sum(a * b, axis=-1)
         den = _safe_norm(a, axis=-1) * _safe_norm(b, axis=-1)
         cos = num / den
@@ -39,8 +39,8 @@ def delta_l2_ratio_tokens(h_now_layers: List[np.ndarray], h_prev_layers: List[np
     seq_len = h_now_layers[0].shape[0]
     ratio_sum = np.zeros((seq_len,), dtype=np.float32)
     for li in range(num_layers):
-        a = h_now_layers[li]
-        b = h_prev_layers[li]
+        a = np.ascontiguousarray(h_now_layers[li]).copy()
+        b = np.ascontiguousarray(h_prev_layers[li]).copy()
         diff = a - b
         num = _safe_norm(diff, axis=-1)
         den = _safe_norm(b, axis=-1) + eps

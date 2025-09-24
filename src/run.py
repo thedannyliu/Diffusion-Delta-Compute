@@ -139,11 +139,18 @@ def compute_token_observables(
     prev_logits: np.ndarray,
     step_index: int,
     num_steps: int,
+    valid_mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     cos = cosine_similarity_tokens(current_hidden, prev_hidden)
     dl2 = delta_l2_ratio_tokens(current_hidden, prev_hidden)
     kl = kl_divergence_tokens(current_logits, prev_logits)
     entropy, margin = logits_entropy_and_margin(current_logits)
+    if valid_mask is not None:
+        cos = cos[valid_mask]
+        dl2 = dl2[valid_mask]
+        kl = kl[valid_mask]
+        entropy = entropy[valid_mask]
+        margin = margin[valid_mask]
     denom = max(1, num_steps - 1)
     step_frac = np.full_like(cos, fill_value=float(step_index) / float(denom), dtype=np.float32)
     return cos, dl2, kl, entropy, margin, step_frac
@@ -162,6 +169,8 @@ def run_teacher(
     aggregates: List[Dict] = []
     cos_means: List[List[float]] = []
     dl2_means: List[List[float]] = []
+    kl_means: List[List[float]] = []
+    ent_means: List[List[float]] = []
     cos_hist_samples: List[float] = []
 
     feature_blocks: List[np.ndarray] = []
@@ -181,13 +190,30 @@ def run_teacher(
         state = engine.encode_prompt(prompt)
         prev_hidden: Optional[List[np.ndarray]] = None
         prev_logits: Optional[np.ndarray] = None
+        prev_aux: Optional[Dict] = None
         step_cos_means: List[float] = []
         step_dl2_means: List[float] = []
+        step_kl_means: List[float] = []
+        step_ent_means: List[float] = []
+        # Per-layer accumulation for mean and IQR
+        layer_step_values_cos: Dict[Tuple[int, int], np.ndarray] = {}
+        layer_step_values_dl2: Dict[Tuple[int, int], np.ndarray] = {}
 
         seq_start = time.time()
         for t in range(num_steps):
             out = engine.step(state, t)
             if prev_hidden is not None and prev_logits is not None:
+                # Build valid mask (exclude padding and special tokens)
+                valid_mask: Optional[np.ndarray] = None
+                if isinstance(out.aux, dict):
+                    ids = out.aux.get("input_ids")
+                    special = out.aux.get("special_tokens_mask")
+                    pad_id = out.aux.get("pad_token_id", -1)
+                    if ids is not None:
+                        ids = np.array(ids, dtype=np.int64)
+                        is_pad = (ids == pad_id) if pad_id != -1 else np.zeros_like(ids, dtype=bool)
+                        is_special = np.array(special, dtype=bool) if special is not None else np.zeros_like(ids, dtype=bool)
+                        valid_mask = ~(is_pad | is_special)
                 cos, dl2, kl, ent, margin, step_frac = compute_token_observables(
                     out.hidden_by_layer,
                     prev_hidden,
@@ -195,10 +221,23 @@ def run_teacher(
                     prev_logits,
                     t,
                     num_steps,
+                    valid_mask=valid_mask,
                 )
                 step_cos_means.append(float(np.mean(cos)))
                 step_dl2_means.append(float(np.mean(dl2)))
+                step_kl_means.append(float(np.mean(kl)))
+                step_ent_means.append(float(np.mean(ent)))
                 cos_hist_samples.extend(cos.flatten().tolist())
+                # Save per-layer token vectors for IQR
+                for li, (h_now, h_prev) in enumerate(zip(out.hidden_by_layer, prev_hidden)):
+                    # Compute per-token layer-wise metrics (masked)
+                    cos_layer = cosine_similarity_tokens([h_now], [h_prev])
+                    dl2_layer = delta_l2_ratio_tokens([h_now], [h_prev])
+                    if valid_mask is not None:
+                        cos_layer = cos_layer[valid_mask]
+                        dl2_layer = dl2_layer[valid_mask]
+                    layer_step_values_cos[(li, t)] = cos_layer
+                    layer_step_values_dl2[(li, t)] = dl2_layer
                 aggregates.append(
                     {
                         "mode": "teacher",
@@ -226,14 +265,34 @@ def run_teacher(
                         axis=-1,
                     )
                     feature_meta.append(meta)
+            # Snapshot prev strictly after metrics (prevent view overwrite)
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
             prev_logits = out.logits.copy()
+            prev_aux = out.aux if isinstance(out.aux, dict) else None
 
         cos_means.append(step_cos_means)
         dl2_means.append(step_dl2_means)
+        kl_means.append(step_kl_means)
+        ent_means.append(step_ent_means)
         per_seq_latency_ms.append((time.time() - seq_start) * 1000.0)
 
     save_jsonl(os.path.join(out_dirs["runs"], f"teacher_{timestamp}.jsonl"), aggregates)
+    # Export layer×step mean and IQR to CSV
+    teacher_csv = os.path.join(out_dirs["runs"], f"teacher_aggregates_{timestamp}.csv")
+    with open(teacher_csv, "w", encoding="utf-8") as f:
+        f.write("layer,step,metric,mean,q25,q75\n")
+        # infer num_layers, num_steps from collected keys
+        cos_keys = list(layer_step_values_cos.keys())
+        steps = sorted(set(k[1] for k in cos_keys))
+        layers = sorted(set(k[0] for k in cos_keys))
+        for li in layers:
+            for t in steps:
+                if (li, t) in layer_step_values_cos:
+                    v = layer_step_values_cos[(li, t)]
+                    f.write(f"{li},{t},cos,{np.mean(v):.6f},{np.percentile(v,25):.6f},{np.percentile(v,75):.6f}\n")
+                if (li, t) in layer_step_values_dl2:
+                    v = layer_step_values_dl2[(li, t)]
+                    f.write(f"{li},{t},dl2,{np.mean(v):.6f},{np.percentile(v,25):.6f},{np.percentile(v,75):.6f}\n")
 
     if len(cos_means) > 0 and len(cos_means[0]) > 0:
         arr = np.array(cos_means).T  # steps x prompts
@@ -241,6 +300,47 @@ def run_teacher(
     if len(dl2_means) > 0 and len(dl2_means[0]) > 0:
         arr = np.array(dl2_means).T
         save_heatmap(arr, os.path.join(out_dirs["figures"], f"teacher_dl2_heatmap_{timestamp}.png"), title="ΔL2 mean per step")
+    # Export KL/entropy step curves to CSV for further plotting
+    if kl_means:
+        kl_csv = os.path.join(out_dirs["runs"], f"teacher_kl_entropy_{timestamp}.csv")
+        steps = list(range(len(kl_means[0]))) if kl_means[0] else []
+        with open(kl_csv, "w", encoding="utf-8") as f:
+            f.write("step,kl_mean,entropy_mean\n")
+            for s in steps:
+                km = float(np.mean([row[s] for row in kl_means if len(row) > s]))
+                em = float(np.mean([row[s] for row in ent_means if len(row) > s]))
+                f.write(f"{s},{km:.6f},{em:.6f}\n")
+    # Export layer bands (L1-3, L4-6, L7+) IQR/mean
+    if layer_step_values_cos:
+        bands_csv = os.path.join(out_dirs["runs"], f"teacher_layer_bands_{timestamp}.csv")
+        with open(bands_csv, "w", encoding="utf-8") as f:
+            f.write("band,step,metric,mean,q25,q75\n")
+            cos_keys = list(layer_step_values_cos.keys())
+            steps = sorted(set(k[1] for k in cos_keys))
+            layers = sorted(set(k[0] for k in cos_keys))
+            # Define bands
+            def band_of(li: int) -> str:
+                if li <= 2:
+                    return "L1-3"
+                if li <= 5:
+                    return "L4-6"
+                return "L7+"
+            for t in steps:
+                band_to_vals_cos: Dict[str, List[float]] = {"L1-3": [], "L4-6": [], "L7+": []}
+                band_to_vals_dl2: Dict[str, List[float]] = {"L1-3": [], "L4-6": [], "L7+": []}
+                for li in layers:
+                    b = band_of(li)
+                    if (li, t) in layer_step_values_cos:
+                        band_to_vals_cos[b].extend(layer_step_values_cos[(li, t)].tolist())
+                    if (li, t) in layer_step_values_dl2:
+                        band_to_vals_dl2[b].extend(layer_step_values_dl2[(li, t)].tolist())
+                for b in ["L1-3", "L4-6", "L7+"]:
+                    if band_to_vals_cos[b]:
+                        v = np.array(band_to_vals_cos[b], dtype=np.float32)
+                        f.write(f"{b},{t},cos,{np.mean(v):.6f},{np.percentile(v,25):.6f},{np.percentile(v,75):.6f}\n")
+                    if band_to_vals_dl2[b]:
+                        v = np.array(band_to_vals_dl2[b], dtype=np.float32)
+                        f.write(f"{b},{t},dl2,{np.mean(v):.6f},{np.percentile(v,25):.6f},{np.percentile(v,75):.6f}\n")
     if len(cos_hist_samples) > 0:
         save_hist(np.array(cos_hist_samples), os.path.join(out_dirs["figures"], f"teacher_cosine_hist_{timestamp}.png"), title="Cosine similarity histogram")
 
@@ -307,6 +407,11 @@ def run_rule_gate(
 
         total_tokens_computed = 0
         total_tokens_possible = 0
+        # New: track token×layer×step ops
+        num_layers_seen: Optional[int] = None
+        baseline_ops = 0
+        actual_ops = 0
+        skip_stats_rows: List[str] = []
 
         seq_start = time.time()
         for t in range(num_steps):
@@ -314,8 +419,14 @@ def run_rule_gate(
                 out = engine.step(state, t)
                 prev_hidden = [h.copy() for h in out.hidden_by_layer]
                 prev_logits = out.logits.copy()
-                total_tokens_computed += out.logits.shape[0]
-                total_tokens_possible += out.logits.shape[0]
+                seq_len = out.logits.shape[0]
+                if num_layers_seen is None:
+                    num_layers_seen = len(out.hidden_by_layer)
+                total_tokens_computed += seq_len
+                total_tokens_possible += seq_len
+                baseline_ops += (num_layers_seen * seq_len)
+                actual_ops += (num_layers_seen * seq_len)
+                skip_stats_rows.append(f"{t},{seq_len},0,0.0,{num_layers_seen},0")
                 continue
 
             # Get compute mask based on current freeze cooldowns
@@ -353,9 +464,16 @@ def run_rule_gate(
                     num_steps,
                 )
 
-            computed_tokens = out.logits.shape[0] if mask_to_use is None else int(np.sum(mask_to_use))
-            total_tokens_computed += computed_tokens
-            total_tokens_possible += out.logits.shape[0]
+            seq_len = out.logits.shape[0]
+            frozen_tokens = 0 if mask_to_use is None else (seq_len - int(np.sum(mask_to_use)))
+            frozen_ratio = float(frozen_tokens) / float(seq_len)
+            total_tokens_computed += (seq_len - frozen_tokens)
+            total_tokens_possible += seq_len
+            if num_layers_seen is None:
+                num_layers_seen = len(out.hidden_by_layer)
+            baseline_ops += (num_layers_seen * seq_len)
+            actual_ops += (num_layers_seen * (seq_len - frozen_tokens))
+            skip_stats_rows.append(f"{t},{seq_len},{frozen_tokens},{frozen_ratio:.6f},{num_layers_seen},0")
 
             gate.update(
                 feats_cos=cos_now,
@@ -372,9 +490,24 @@ def run_rule_gate(
 
         per_seq_latency_ms.append((time.time() - seq_start) * 1000.0)
 
-        savings = 1.0 - (total_tokens_computed / max(1, total_tokens_possible))
-        savings_ratios.append(float(savings))
-        aggregates.append({"mode": "rule_gate", "prompt_len": len(prompt), "savings": float(savings)})
+        # Token savings (old): per-step token compute ratio
+        token_savings = 1.0 - (total_tokens_computed / max(1, total_tokens_possible))
+        # FLOPs-proxy savings (new): token×layer×step
+        flops_savings = 1.0 - (actual_ops / max(1, baseline_ops))
+        savings_ratios.append(float(flops_savings))
+        aggregates.append({
+            "mode": "rule_gate",
+            "prompt_len": len(prompt),
+            "token_savings": float(token_savings),
+            "flops_savings": float(flops_savings),
+        })
+
+        # Write skip_stats.csv for this prompt
+        stats_csv = os.path.join(out_dirs["runs"], f"skip_stats_{int(time.time())}.csv")
+        with open(stats_csv, "w", encoding="utf-8") as f:
+            f.write("step,seq_len,frozen_tokens,frozen_ratio,num_layers,skipped_layers\n")
+            for row in skip_stats_rows:
+                f.write(row + "\n")
 
         if consistency_check:
             # Run full-compute baseline for the same prompt and compare final token argmax
@@ -625,6 +758,11 @@ def main() -> None:
     wandb_run = None
     if wandb is not None:
         try:
+            os.environ.setdefault("WANDB_MODE", "online")
+            try:
+                wandb.require("core")
+            except Exception:
+                pass
             wandb_run = wandb.init(project=os.environ.get("WANDB_PROJECT", "dcllm-delta"), name=os.path.basename(run_dir), dir=run_dir)
         except Exception as exc:  # pragma: no cover
             print(f"[wandb] init failed: {exc}; continuing without W&B logging.")

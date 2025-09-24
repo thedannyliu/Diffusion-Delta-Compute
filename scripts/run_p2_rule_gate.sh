@@ -2,6 +2,7 @@
 set -euo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PYTHON=${PYTHON:-python}
 if [[ $# -gt 0 ]]; then
   CONFIG_PATH=$1
   shift
@@ -23,7 +24,7 @@ fi
 
 CLI_ARGS+=("$@")
 
-echo "[P2] Running rule-based gate with config: $CONFIG_PATH"
+echo "[P2] Running rule-based gate with config: $CONFIG_PATH (python=$PYTHON)"
 pushd "$PROJECT_ROOT" >/dev/null
-python -m src.run "${CLI_ARGS[@]}"
+"$PYTHON" -m src.run "${CLI_ARGS[@]}"
 popd >/dev/null

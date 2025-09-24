@@ -5,12 +5,18 @@ num_prompts: 16
 max_new_tokens: 128
 num_steps: 12
 exp_name: wikitext_rule_gate
-tau: 0.95
-rho: 0.10
-m: 2
-freeze_K: 2
+tau: 0.90
+rho: 0.20
+m: 1
+freeze_K: 3
 layer_recompute_M: 2
 use_d2f_lora: false
+model_path: /storage/ice1/2/9/eliu354/Projects/Diffusion-Delta-Compute/models/checkpoints/Dream-v0-Instruct-7B
+lora_path: /storage/ice1/2/9/eliu354/Projects/Diffusion-Delta-Compute/models/lora/D2F_Dream_Base_7B_Lora
 watchdog:
   min_cos: 0.90
   max_kl: 0.02
+
+# 超保守：tau=0.999, rho=0.00, m=3, K=1 → flops_savings ≈ 0。
+# 中等（預設）：tau=0.95, rho=0.10, m=2, K=2 → flops_savings 約 10–30%，視內容變動。
+# 寬鬆：tau=0.90, rho=0.20, m=1, K=3 → flops_savings 明顯上升，品質需對照。
