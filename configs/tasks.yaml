@@ -1,0 +1,17 @@
+smoke:
+  max_new_tokens: 128
+  datasets:
+    - name: wikitext
+      subset: wikitext-2-raw-v1
+      n_eval: 512
+      metric: ppl
+    - name: lambada_openai
+      subset: en
+      n_eval: 500
+      metric: acc
+    - name: gsm8k
+      subset: main
+      n_eval: 1000
+      metric: em
+
+

@@ -1,0 +1,26 @@
+# Experiment configuration example
+phase: P2  # P1 | P2 | P3
+engine: d2f  # mock | d2f
+data_root: /storage/ice1/2/9/eliu354/Projects/Diffusion-Delta-Compute/data
+models_root: /storage/ice1/2/9/eliu354/Projects/Diffusion-Delta-Compute/models
+outputs_root: /storage/ice1/2/9/eliu354/Projects/Diffusion-Delta-Compute/reports
+exp_name: wikitext_smoke
+
+# D2F options
+use_d2f_lora: false
+lora_path: /storage/ice1/2/9/eliu354/Projects/Diffusion-Delta-Compute/models/d2f-lora
+model_path: /storage/ice1/2/9/eliu354/Projects/Diffusion-Delta-Compute/models/d2f-dream
+
+# Run params
+num_prompts: 64
+max_new_tokens: 128
+num_steps: 12
+
+# Rule gate
+tau: 0.95
+rho: 0.10
+m: 2
+freeze_K: 2
+watchdog_min_cos: 0.90
+watchdog_max_kl: 0.02
+layer_recompute_M: 2

@@ -1,0 +1,15 @@
+phase: P1
+engine: d2f
+task: wikitext
+num_prompts: 16
+max_new_tokens: 128
+num_steps: 12
+exp_name: wikitext_smoke
+dump_features_dir: features
+use_d2f_lora: false
+model_path: /storage/ice1/2/9/eliu354/Projects/Diffusion-Delta-Compute/models/checkpoints/Dream-v0-Instruct-7B
+lora_path: /storage/ice1/2/9/eliu354/Projects/Diffusion-Delta-Compute/models/lora/D2F_Dream_Base_7B_Lora
+label_thresholds:
+  cosine_tau: 0.97
+  delta_l2_rho: 0.05
+  kl_max: 0.01
