@@ -69,6 +69,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--watchdog_min_cos", type=float, default=None)
     parser.add_argument("--watchdog_max_kl", type=float, default=None)
     parser.add_argument("--layer_recompute_M", type=int, default=None)
+    parser.add_argument("--consistency_full_compute", action="store_true", help="Run full-compute baseline and compare outputs; write difference report")
     return parser.parse_args()
 
 
@@ -795,6 +796,11 @@ def main() -> None:
             num_steps=num_steps,
             max_seq_len=max_new_tokens,
         )
+        # Pass layer reuse cadence into engine (optional)
+        try:
+            engine.layer_recompute_M = int(coalesce(args.layer_recompute_M, cfg.get("layer_recompute_M"), 0) or 0)
+        except Exception:
+            engine.layer_recompute_M = 0
     else:
         raise ValueError(f"Unsupported engine: {engine_name}")
 
@@ -812,6 +818,30 @@ def main() -> None:
                 dump_features_dir=dump_features_dir,
                 label_thresholds=label_thresholds,
             )
+            if args.consistency_full_compute and engine_name == "d2f":
+                # Full-compute twice to verify stability; write difference report
+                diffs_csv = os.path.join(out_dirs["runs"], f"consistency_diffs_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+                with open(diffs_csv, "w", encoding="utf-8") as f:
+                    f.write("prompt_idx,step,logits_match,hidden_cos_mean\n")
+                    for pi, prompt in enumerate(prompts):
+                        s1 = engine.encode_prompt(prompt)
+                        s2 = engine.encode_prompt(prompt)
+                        prev1_h = prev2_h = None
+                        prev1_z = prev2_z = None
+                        for t in range(num_steps):
+                            o1 = engine.step(s1, t, compute_mask=None)
+                            o2 = engine.step(s2, t, compute_mask=None)
+                            logits_match = int(np.allclose(o1.logits, o2.logits, atol=1e-6))
+                            hidden_cos_mean = 1.0
+                            if prev1_h is not None and prev2_h is not None:
+                                c1 = cosine_similarity_tokens(o1.hidden_by_layer, prev1_h)
+                                c2 = cosine_similarity_tokens(o2.hidden_by_layer, prev2_h)
+                                hidden_cos_mean = float(0.5 * (np.mean(c1) + np.mean(c2)))
+                            f.write(f"{pi},{t},{logits_match},{hidden_cos_mean:.6f}\n")
+                            prev1_h = [h.copy() for h in o1.hidden_by_layer]
+                            prev2_h = [h.copy() for h in o2.hidden_by_layer]
+                            prev1_z = o1.logits.copy()
+                            prev2_z = o2.logits.copy()
         elif mode == "rule_gate":
             rule_cfg = RuleGateConfig(
                 cosine_tau=tau,

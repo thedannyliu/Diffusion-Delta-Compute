@@ -21,7 +21,7 @@ class StepOutputs:
     hidden_by_layer: List[np.ndarray]  # [n_layers][seq, hidden]
     logits: np.ndarray  # [seq, vocab]
     attn_stats: Optional[Dict] = None
-    aux: Optional[Dict] = None
+    aux: Optional[Dict] = None  # may include: input_ids, special_tokens_mask, pad_token_id, layer_mask, sigma, t
 
 
 class BaseEngine(ABC):

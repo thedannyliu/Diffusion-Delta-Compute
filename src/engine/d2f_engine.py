@@ -78,12 +78,27 @@ class D2FDreamEngine(BaseEngine):
         layers = []
         for h in hidden_states[1:]:  # skip embeddings
             layers.append(h[0].detach().cpu().float().numpy())  # [seq, hidden]
-        # Inject step-dependent small noise to emulate diffusion progression
+        # Layer-reuse (optional): every M steps, shallow layers are reused
+        layer_mask = None
+        if hasattr(self, "layer_recompute_M") and self.layer_recompute_M and self.layer_recompute_M > 1:
+            M = int(self.layer_recompute_M)
+            layer_mask = np.ones((len(layers),), dtype=bool)
+            shallow_reuse_upto = min(3, len(layers))  # L1-3 reuse window
+            if (t % M) != 0:
+                layer_mask[:shallow_reuse_upto] = False
+                # overwrite shallow layers with prev
+                if state.prev_hidden_by_layer is not None:
+                    for li in range(shallow_reuse_upto):
+                        layers[li] = state.prev_hidden_by_layer[li].copy()
+
+        # Inject step-dependent small noise to emulate diffusion progression on computed tokens
         rng = state.rng
         seq_len = layers[0].shape[0]
         noise_scale = max(1e-3, 0.08 * (1.0 - float(t) / max(1, self._num_steps)))
         token_mask = np.ones((seq_len,), dtype=bool) if compute_mask is None else compute_mask.astype(bool)
         for li in range(len(layers)):
+            if layer_mask is not None and layer_mask[li] is False:
+                continue
             noise = rng.normal(0.0, noise_scale, size=layers[li].shape).astype(np.float32)
             layers[li][token_mask] = layers[li][token_mask] + noise[token_mask]
         # Logits via output embeddings if available, using the last hidden after noise
@@ -127,6 +142,8 @@ class D2FDreamEngine(BaseEngine):
         if special_mask_np is not None:
             aux["special_tokens_mask"] = special_mask_np
         aux["pad_token_id"] = int(pad_id)
+        if layer_mask is not None:
+            aux["layer_mask"] = layer_mask
         return StepOutputs(hidden_by_layer=layers, logits=logits_t, attn_stats=None, aux=aux)
 
     def decode(self, state: EngineState) -> str:

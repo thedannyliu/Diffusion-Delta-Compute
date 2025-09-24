@@ -13,6 +13,7 @@ fi
 ENGINE=${ENGINE:-}
 OUT_DIR=${OUT_DIR:-}
 MODE=rule_gate
+LAYER_M=${LAYER_M:-}
 
 CLI_ARGS=("--mode" "$MODE" "--config" "$CONFIG_PATH")
 if [[ -n "$ENGINE" ]]; then
@@ -20,6 +21,9 @@ if [[ -n "$ENGINE" ]]; then
 fi
 if [[ -n "$OUT_DIR" ]]; then
   CLI_ARGS+=("--out_dir" "$OUT_DIR")
+fi
+if [[ -n "$LAYER_M" ]]; then
+  CLI_ARGS+=("--layer_recompute_M" "$LAYER_M")
 fi
 
 CLI_ARGS+=("$@")

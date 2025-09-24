@@ -15,6 +15,7 @@ class RuleGateConfig:
     watchdog_min_cos: float = 0.90
     watchdog_max_kl: float = 0.02
     layer_recompute_M: int = 2
+    max_frozen_fraction_per_step: float = 0.90  # cap per-step frozen tokens to avoid full-stop
 
 
 @dataclass
@@ -73,7 +74,24 @@ class RuleGate:
         counters[update_mask & (~stable)] = 0
 
         start_freeze = (counters >= self.cfg.consecutive_m) & (cooldown <= 0) & active
-        cooldown[start_freeze] = self.cfg.freeze_K
+        if np.any(start_freeze):
+            # Cap per-step frozen fraction
+            current_frozen = (cooldown > 0)
+            max_frozen = int(self.cfg.max_frozen_fraction_per_step * num_tokens)
+            allowed_new = max(0, max_frozen - int(current_frozen.sum()))
+            indices = np.nonzero(start_freeze)[0]
+            if len(indices) > allowed_new and allowed_new > 0:
+                # Score stable tokens by high cos and low dl2
+                score = feats_cos[indices] - feats_dl2[indices]
+                topk = np.argsort(-score)[:allowed_new]
+                selected = np.zeros_like(start_freeze)
+                selected[indices[topk]] = True
+                start_freeze = selected
+            elif allowed_new <= 0:
+                start_freeze = np.zeros_like(start_freeze, dtype=bool)
+            cooldown[start_freeze] = self.cfg.freeze_K
+            # Reset counters when entering freeze to enforce consecutive semantics
+            counters[start_freeze] = 0
 
         # Decrement cooldown at end of step
         freezing_now = cooldown > 0
@@ -84,3 +102,9 @@ class RuleGate:
         self._counters = counters
         self._cooldown = cooldown
         return StepGateResult(compute_mask=compute_mask_next, counters=counters.copy())
+
+    def get_internal_state(self) -> dict:
+        return {
+            "counters": None if self._counters is None else self._counters.copy(),
+            "cooldown": None if self._cooldown is None else self._cooldown.copy(),
+        }
