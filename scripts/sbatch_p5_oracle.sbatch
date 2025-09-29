@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J dcllm_p2_rule
+#SBATCH -J dcllm_p5_oracle
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
 #SBATCH -c 8
@@ -29,18 +29,12 @@ export PYTHON="${PYTHON:-$(command -v python)}"
 export WANDB_MODE=${WANDB_MODE:-online}
 mkdir -p logs
 
-CONFIG_PATH=${CONFIG_PATH:-configs/p2_smoke.yaml}
+CONFIG_PATH=${CONFIG_PATH:-configs/p5_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 OUT_DIR=${OUT_DIR:-}
 TASKS_CFG=${TASKS_CFG:-}
 PATHS_CFG=${PATHS_CFG:-}
-THRESHOLDS_CFG=${THRESHOLDS_CFG:-}
-PROFILE=${PROFILE:-}
-DATASET_KEY=${DATASET_KEY:-}
-RISK_DELTA=${RISK_DELTA:-}
-BUDGET_FRACTION=${BUDGET_FRACTION:-}
-LAYER_M=${LAYER_M:-}
 
-echo "[sbatch] P2 rule gate run using config=${CONFIG_PATH} engine=${ENGINE}"
-EXPORT_VARS=ALL,ENGINE=${ENGINE},OUT_DIR=${OUT_DIR},TASKS_CFG=${TASKS_CFG},PATHS_CFG=${PATHS_CFG},THRESHOLDS_CFG=${THRESHOLDS_CFG},PROFILE=${PROFILE},DATASET_KEY=${DATASET_KEY},RISK_DELTA=${RISK_DELTA},BUDGET_FRACTION=${BUDGET_FRACTION},LAYER_M=${LAYER_M}
-srun --export=${EXPORT_VARS} bash scripts/run_p2_rule_gate.sh "$CONFIG_PATH" "$@"
+echo "[sbatch] P5 oracle run using config=${CONFIG_PATH} engine=${ENGINE}"
+EXPORT_VARS=ALL,ENGINE=${ENGINE},OUT_DIR=${OUT_DIR},TASKS_CFG=${TASKS_CFG},PATHS_CFG=${PATHS_CFG}
+srun --export=${EXPORT_VARS} bash scripts/run_p5_oracle.sh "$CONFIG_PATH" "$@"
