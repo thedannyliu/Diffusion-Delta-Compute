@@ -5,6 +5,8 @@ from typing import Optional
 
 import numpy as np
 
+from .budget import BudgetController
+
 
 @dataclass
 class RuleGateConfig:
@@ -16,6 +18,7 @@ class RuleGateConfig:
     watchdog_max_kl: float = 0.02
     layer_recompute_M: int = 2
     max_frozen_fraction_per_step: float = 0.90  # cap per-step frozen tokens to avoid full-stop
+    gamma_margin: float = 0.08
 
 
 @dataclass
@@ -23,6 +26,8 @@ class StepGateResult:
     compute_mask: Optional[np.ndarray]
     counters: np.ndarray
     probabilities: Optional[np.ndarray] = None
+    risk_scores: Optional[np.ndarray] = None
+    freeze_mask: Optional[np.ndarray] = None
 
 
 class RuleGate:
@@ -53,14 +58,18 @@ class RuleGate:
         feats_kl: np.ndarray,
         entropy: np.ndarray,
         margin: np.ndarray,
+        risk_scores: np.ndarray,
+        risk_threshold: float,
         num_tokens: int,
         compute_mask: Optional[np.ndarray] = None,
+        budget_controller: Optional[BudgetController] = None,
     ) -> StepGateResult:
         self._ensure_state(num_tokens)
         counters = self._counters
         cooldown = self._cooldown
 
-        stable = (feats_cos >= self.cfg.cosine_tau) | (feats_dl2 <= self.cfg.delta_l2_rho)
+        stable = ((feats_cos >= self.cfg.cosine_tau) | (feats_dl2 <= self.cfg.delta_l2_rho)) & (margin >= self.cfg.gamma_margin)
+        safe = stable & (risk_scores <= risk_threshold)
 
         if compute_mask is None:
             active = np.ones_like(stable, dtype=bool)
@@ -70,10 +79,10 @@ class RuleGate:
         not_frozen = cooldown <= 0
         update_mask = active & not_frozen
 
-        counters[update_mask & stable] += 1
-        counters[update_mask & (~stable)] = 0
+        counters[update_mask & safe] += 1
+        counters[update_mask & (~safe)] = 0
 
-        start_freeze = (counters >= self.cfg.consecutive_m) & (cooldown <= 0) & active
+        start_freeze = (counters >= self.cfg.consecutive_m) & (cooldown <= 0) & active & safe
         if np.any(start_freeze):
             # Cap per-step frozen fraction
             current_frozen = (cooldown > 0)
@@ -82,7 +91,7 @@ class RuleGate:
             indices = np.nonzero(start_freeze)[0]
             if len(indices) > allowed_new and allowed_new > 0:
                 # Score stable tokens by high cos and low dl2
-                score = feats_cos[indices] - feats_dl2[indices]
+                score = feats_cos[indices] - feats_dl2[indices] - risk_scores[indices]
                 topk = np.argsort(-score)[:allowed_new]
                 selected = np.zeros_like(start_freeze)
                 selected[indices[topk]] = True
@@ -99,9 +108,21 @@ class RuleGate:
         cooldown[cooldown < 0] = 0
 
         compute_mask_next = (cooldown <= 0)
+        if budget_controller is not None:
+            adjusted = budget_controller.select(compute_mask_next.astype(bool), risk_scores)
+            # Tokens switched from compute→freeze should enter cooldown for at least one step
+            newly_frozen = (~adjusted) & compute_mask_next
+            cooldown[newly_frozen] = np.maximum(cooldown[newly_frozen], 1)
+            compute_mask_next = adjusted
         self._counters = counters
         self._cooldown = cooldown
-        return StepGateResult(compute_mask=compute_mask_next, counters=counters.copy())
+        freeze_mask = ~(compute_mask_next.astype(bool))
+        return StepGateResult(
+            compute_mask=compute_mask_next,
+            counters=counters.copy(),
+            risk_scores=risk_scores.copy(),
+            freeze_mask=freeze_mask,
+        )
 
     def get_internal_state(self) -> dict:
         return {
