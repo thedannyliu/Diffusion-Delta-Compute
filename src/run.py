@@ -310,6 +310,10 @@ def run_teacher(
                 ent = obs.entropy
                 margin = obs.margin
                 step_frac = obs.step_frac
+                # Record oracle skip ratio independent of feature dumping
+                if oracle_eval and not dump_features_dir:
+                    labels_oracle = ((cos >= cos_tau) & (dl2 <= dl2_rho) & (kl <= kl_max)).astype(np.float32)
+                    oracle_ratios.append(float(np.mean(labels_oracle)))
                 step_cos_means.append(float(np.mean(cos)))
                 step_dl2_means.append(float(np.mean(dl2)))
                 step_kl_means.append(float(np.mean(kl)))
@@ -499,7 +503,7 @@ def run_rule_gate(
     savings_ratios: List[float] = []
 
     gate = RuleGate(cfg)
-    calibrator = ConformalRiskCalibrator(delta=risk_delta)
+    calibrator = ConformalRiskCalibrator(delta=risk_delta, initial_quantile=0.60)
     budget_controller = BudgetController(budget_fraction=budget_fraction)
     rollback = RollbackBuffer()
 
@@ -698,7 +702,7 @@ def run_learned_gate(
     per_seq_latency_ms: List[float] = []
     final_consistency: List[float] = []
     total_start = time.time()
-    calibrator = ConformalRiskCalibrator(delta=risk_delta)
+    calibrator = ConformalRiskCalibrator(delta=risk_delta, initial_quantile=0.60)
     budget_controller = BudgetController(budget_fraction=budget_fraction)
     risk_threshold_history: List[float] = []
     delta_violation_history: List[float] = []
@@ -764,10 +768,11 @@ def run_learned_gate(
             total_tokens_computed += computed_tokens
             total_tokens_possible += out.logits.shape[0]
 
+            # Use raw features to match training FEATURE_NAMES[:7]
             features = np.stack(
                 [
-                    obs.cosine_norm,
-                    obs.delta_l2_norm,
+                    obs.cosine,
+                    obs.delta_l2,
                     obs.kl,
                     obs.entropy,
                     obs.margin,
@@ -897,6 +902,13 @@ def run_adaptive(
         scheduler.reset()
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
+    # Simple visuals: histogram of per-sequence estimated skip ratios
+    try:
+        from src.viz.plots import save_hist
+        if skip_estimates:
+            save_hist(np.array(skip_estimates), os.path.join(out_dirs["figures"], f"adaptive_skip_hist_{timestamp}.png"), title="Adaptive estimated skip ratio per sequence")
+    except Exception:
+        pass
     summary = {
         "mode": "adaptive",
         "num_prompts": len(prompts),
@@ -948,6 +960,16 @@ def run_baselines(
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     with open(os.path.join(out_dirs["runs"], f"baselines_{timestamp}.json"), "w", encoding="utf-8") as f:
         json.dump({"num_steps": num_steps, "baselines": baselines}, f, indent=2)
+    # Also write a quick histogram for visualization
+    try:
+        from src.viz.plots import save_hist
+        save_hist(
+            np.array([b["skip_ratio_est"] for b in baselines], dtype=np.float32),
+            os.path.join(out_dirs["figures"], f"baselines_skip_hist_{timestamp}.png"),
+            title="Baseline estimated skip ratios",
+        )
+    except Exception:
+        pass
 
 
 def main() -> None:
