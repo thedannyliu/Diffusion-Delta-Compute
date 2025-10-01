@@ -273,6 +273,7 @@ def run_teacher(
     dl2_rho = float(label_cfg.get("delta_l2_rho", 0.05))
     kl_max = float(label_cfg.get("kl_max", 0.01))
     timestamp = time.strftime("%Y%m%d_%H%M%S")
+    layer_step_mse: Dict[Tuple[int, int], List[float]] = defaultdict(list)
 
     for prompt_idx, prompt in enumerate(prompts):
         state = engine.encode_prompt(prompt)
@@ -348,6 +349,8 @@ def run_teacher(
                     layer_mse_values.append(float(np.mean(np.square(diff))))
                 if layer_mse_values:
                     prompt_mse.append(float(np.mean(layer_mse_values)))
+                    for li, mse_value in enumerate(layer_mse_values):
+                        layer_step_mse[(li, t)].append(mse_value)
                 # Save per-layer token vectors for IQR
                 for li, (h_now, h_prev) in enumerate(zip(out.hidden_by_layer, prev_hidden)):
                     # Compute per-token layer-wise metrics (masked)
@@ -413,6 +416,20 @@ def run_teacher(
         if stability_max is not None:
             stability_lengths.extend(int(x) for x in stability_max.tolist())
         per_seq_latency_ms.append((time.time() - seq_start) * 1000.0)
+
+    layer_mse_curves: Dict[int, List[float]] = {}
+    mse_steps: List[int] = list(range(1, num_steps)) if num_steps > 1 else []
+    if layer_step_mse and mse_steps:
+        layer_indices = sorted(set(li for li, _ in layer_step_mse.keys()))
+        for li in layer_indices:
+            series: List[float] = []
+            for step in mse_steps:
+                values = layer_step_mse.get((li, step))
+                if values:
+                    series.append(float(np.mean(values)))
+                else:
+                    series.append(float("nan"))
+            layer_mse_curves[li] = series
 
     save_jsonl(os.path.join(out_dirs["runs"], f"teacher_{timestamp}.jsonl"), aggregates)
     # Export layer×step mean and IQR to CSV
@@ -520,6 +537,8 @@ def run_teacher(
             stability_lengths,
             per_seq_latency_ms,
             mse_series,
+            layer_mse_curves,
+            mse_steps,
         )
     except Exception:
         pass

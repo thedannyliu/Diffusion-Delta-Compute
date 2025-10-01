@@ -103,6 +103,8 @@ def render_teacher_suite(
     stability_lengths: Sequence[int],
     latencies_ms: Sequence[float],
     mse_series: Sequence[Sequence[float]],
+    layer_mse_curves: Dict[int, Sequence[float]],
+    mse_steps: Sequence[int],
 ) -> None:
     _ensure_dir(figures_dir)
 
@@ -136,6 +138,38 @@ def render_teacher_suite(
         mean_curve = np.nanmean(mse_arr, axis=1)
         steps = np.arange(1, mean_curve.shape[0] + 1, dtype=np.int32)
         _save_line(steps, mean_curve, os.path.join(figures_dir, f"teacher_mse_curve_{timestamp}.png"), "Mean per-step MSE", "step", "MSE")
+
+    # Layer-wise MSE heatmap (mean across prompts)
+    if layer_mse_curves and mse_steps:
+        layer_ids = sorted(layer_mse_curves.keys())
+        matrix = np.asarray([layer_mse_curves[li] for li in layer_ids], dtype=np.float32)
+        if matrix.size:
+            plt = _try_import_matplotlib()
+            out_path = os.path.join(figures_dir, f"teacher_mse_layers_{timestamp}.png")
+            if plt is None:
+                np.savez(out_path.replace(".png", ".npz"), mse=matrix, layers=np.array(layer_ids, dtype=np.int32), steps=np.asarray(mse_steps, dtype=np.int32))
+            else:
+                finite = np.isfinite(matrix)
+                if not np.any(finite):
+                    plt.figure(figsize=(6, 3.5))
+                    plt.title("Layer-wise mean MSE per step (no data)")
+                    plt.savefig(out_path)
+                    plt.close()
+                else:
+                    plot_data = np.where(finite, matrix, float(np.nanmedian(matrix[finite])))
+                    height = max(4.0, 0.35 * len(layer_ids))
+                    width = max(6.0, 0.4 * len(mse_steps))
+                    plt.figure(figsize=(width, height))
+                    im = plt.imshow(plot_data, aspect="auto", origin="lower", cmap="magma")
+                    plt.colorbar(im, label="MSE")
+                    plt.xticks(np.arange(len(mse_steps)), [str(s) for s in mse_steps])
+                    plt.yticks(np.arange(len(layer_ids)), [str(li) for li in layer_ids])
+                    plt.xlabel("step")
+                    plt.ylabel("layer")
+                    plt.title("Layer-wise mean MSE per step")
+                    plt.tight_layout()
+                    plt.savefig(out_path)
+                    plt.close()
 
     # Entropy curve for reference
     ent_arr = _stack_series(ent_means)
