@@ -582,6 +582,8 @@ def run_rule_gate(
     calibrator = ConformalRiskCalibrator(delta=risk_delta, initial_quantile=0.60)
     budget_controller = BudgetController(budget_fraction=budget_fraction)
     rollback = RollbackBuffer()
+    effective_budget_tokens: List[float] = []
+    effective_budget_ops: List[float] = []
 
     watchdog_min_cos = cfg.watchdog_min_cos
     watchdog_max_kl = cfg.watchdog_max_kl
@@ -706,6 +708,8 @@ def run_rule_gate(
         # FLOPs-proxy savings (new): token×layer×step
         flops_savings = 1.0 - (actual_ops / max(1, baseline_ops))
         savings_ratios.append(float(flops_savings))
+        effective_budget_tokens.append(1.0 - token_savings)
+        effective_budget_ops.append(1.0 - flops_savings)
         aggregates.append({
             "mode": "rule_gate",
             "prompt_len": len(prompt),
@@ -765,10 +769,12 @@ def run_rule_gate(
         "latency_ms_p90": float(np.percentile(per_seq_latency_ms, 90) if per_seq_latency_ms else 0.0),
         "throughput_seq_per_s": float(len(prompts) / total_time_s),
         "skip_ratio_mean": float(np.mean(savings_ratios) if savings_ratios else 0.0),
-        "final_token_consistency_mean": float(np.mean(final_consistency) if final_consistency else -1.0),
-        "risk_threshold_mean": float(np.mean(risk_threshold_history) if risk_threshold_history else -1.0),
-        "delta_violation_mean": float(np.mean(delta_violation_history) if delta_violation_history else -1.0),
-        "budget_fraction": float(budget_fraction),
+        "final_token_consistency_mean": float(np.mean(final_consistency)) if final_consistency else None,
+        "risk_threshold_mean": float(np.mean(risk_threshold_history)) if risk_threshold_history else None,
+        "delta_violation_mean": float(np.mean(delta_violation_history)) if delta_violation_history else None,
+        "budget_fraction": float(np.mean(effective_budget_ops)) if effective_budget_ops else None,
+        "budget_fraction_target": float(budget_fraction),
+        "budget_fraction_tokens": float(np.mean(effective_budget_tokens)) if effective_budget_tokens else None,
         "risk_delta": float(risk_delta),
         **{f"gpu_{k}": v for k, v in gpu.items()},
     }
@@ -792,6 +798,7 @@ def run_learned_gate(
 
     aggregates: List[Dict] = []
     savings_ratios: List[float] = []
+    effective_budget_tokens: List[float] = []
     prob_samples: List[float] = []
     freeze_ratios_by_step: Dict[int, List[float]] = defaultdict(list)
 
@@ -909,6 +916,7 @@ def run_learned_gate(
 
         savings = 1.0 - (total_tokens_computed / max(1, total_tokens_possible))
         savings_ratios.append(float(savings))
+        effective_budget_tokens.append(1.0 - savings)
         aggregates.append({"mode": "learned_gate", "prompt_len": len(prompt), "savings": float(savings)})
 
         if consistency_check:
@@ -958,10 +966,11 @@ def run_learned_gate(
         "latency_ms_p90": float(np.percentile(per_seq_latency_ms, 90) if per_seq_latency_ms else 0.0),
         "throughput_seq_per_s": float(len(prompts) / total_time_s),
         "skip_ratio_mean": float(np.mean(savings_ratios) if savings_ratios else 0.0),
-        "final_token_consistency_mean": float(np.mean(final_consistency) if final_consistency else -1.0),
-        "risk_threshold_mean": float(np.mean(risk_threshold_history) if risk_threshold_history else -1.0),
-        "delta_violation_mean": float(np.mean(delta_violation_history) if delta_violation_history else -1.0),
-        "budget_fraction": float(budget_fraction),
+        "final_token_consistency_mean": float(np.mean(final_consistency)) if final_consistency else None,
+        "risk_threshold_mean": float(np.mean(risk_threshold_history)) if risk_threshold_history else None,
+        "delta_violation_mean": float(np.mean(delta_violation_history)) if delta_violation_history else None,
+        "budget_fraction": float(np.mean(effective_budget_tokens)) if effective_budget_tokens else None,
+        "budget_fraction_target": float(budget_fraction),
         "risk_delta": float(risk_delta),
         **{f"gpu_{k}": v for k, v in gpu.items()},
     }
