@@ -3,3 +3,6 @@ engine: mock
 num_prompts: 8
 num_steps: 12
 task: synthetic
+lte_eps: 0.2
+lte_min_consec: 1
+max_stride: 4

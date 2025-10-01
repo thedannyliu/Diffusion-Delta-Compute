@@ -7,10 +7,11 @@ import numpy as np
 
 @dataclass
 class AdaptiveSchedulerConfig:
-    lte_eps: float = 1.5e-2
+    lte_eps: float = 0.2
     min_consecutive: int = 2
     max_stride: int = 4
     base_stride: int = 1
+    use_normalized_lte: bool = False
 
 
 class AdaptiveScheduler:
@@ -25,10 +26,15 @@ class AdaptiveScheduler:
     def stride(self) -> int:
         return self._current_stride
 
-    def observe(self, lte_value: float, risk_value: float) -> None:
-        """Update internal stride state based on observed LTE and risk."""
+    def observe(self, lte_value: float, lte_threshold: float, risk_value: float, risk_threshold: float) -> None:
+        """Update internal stride state based on observed LTE and risk.
 
-        if (lte_value <= self.cfg.lte_eps) and (risk_value <= 1.0):
+        ``risk_value`` is compared against the supplied ``risk_threshold`` so
+        that callers can adapt the decision boundary based on conformal
+        calibration.
+        """
+
+        if (lte_value <= lte_threshold) and (risk_value <= risk_threshold):
             self._streak += 1
             if self._streak >= self.cfg.min_consecutive:
                 self._current_stride = min(self.cfg.max_stride, self._current_stride + 1)
@@ -50,4 +56,3 @@ def heun_lte(estimate_a: np.ndarray, estimate_b: np.ndarray, prev: np.ndarray, e
     diff = np.linalg.norm(estimate_b - estimate_a)
     denom = np.linalg.norm(prev) + eps
     return float(diff / denom)
-

@@ -14,8 +14,8 @@ use_d2f_lora: false
 model_path: /storage/ice1/2/9/eliu354/Projects/Diffusion-Delta-Compute/models/checkpoints/Dream-v0-Instruct-7B
 lora_path: /storage/ice1/2/9/eliu354/Projects/Diffusion-Delta-Compute/models/lora/D2F_Dream_Base_7B_Lora
 watchdog:
-  min_cos: 0.90
-  max_kl: 0.02
+  min_cos: 0.88
+  max_kl: 0.03
 
 # 超保守：tau=0.999, rho=0.00, m=3, K=1 → flops_savings ≈ 0。
 # 中等（預設）：tau=0.95, rho=0.10, m=2, K=2 → flops_savings 約 10–30%，視內容變動。

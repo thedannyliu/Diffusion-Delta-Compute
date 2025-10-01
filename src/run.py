@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -30,7 +31,7 @@ from src.gating.budget import BudgetController
 from src.gating.adaptive import AdaptiveScheduler, AdaptiveSchedulerConfig
 from src.gating.rollback import RollbackBuffer
 from src.eval.tasks import load_wikitext2, load_lambada_openai, load_gsm8k_tiny
-from src.utils.profile import query_gpu_utilization
+from src.utils.profile import query_gpu_utilization, GPUUtilSampler
 from src.utils.config import load_yaml, ensure_output_dirs, save_manifest
 
 try:  # Optional dependency; scripts can run without W&B
@@ -89,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--budget_fraction", type=float, default=1.0, help="Per-step compute budget as fraction of Teacher FLOPs")
     parser.add_argument("--oracle_eval", action="store_true", help="When running Teacher, also compute oracle headroom metrics")
     parser.add_argument("--lte_probe", type=str, default="euler", choices=["none", "euler", "heun"], help="LTE probing strategy")
-    parser.add_argument("--lte_eps", type=float, default=1.5e-2, help="LTE tolerance for adaptive scheduler")
+    parser.add_argument("--lte_eps", type=float, default=0.2, help="LTE tolerance for adaptive scheduler (interpreted in raw ΔL2 units by default)")
     parser.add_argument("--lte_min_consec", type=int, default=2, help="Consecutive LTE acceptances before increasing stride")
     parser.add_argument("--max_stride", type=int, default=4, help="Maximum adaptive stride")
     parser.add_argument("--adaptive_budget", type=float, default=0.20, help="Adaptive total skip budget")
@@ -250,7 +251,12 @@ def run_teacher(
     dl2_means: List[List[float]] = []
     kl_means: List[List[float]] = []
     ent_means: List[List[float]] = []
+    dl2_norm_means: List[List[float]] = []
+    mse_series: List[List[float]] = []
     cos_hist_samples: List[float] = []
+    dl2_hist_samples: List[float] = []
+    dl2_norm_hist_samples: List[float] = []
+    stability_lengths: List[int] = []
 
     feature_blocks: List[np.ndarray] = []
     feature_labels: List[np.ndarray] = []
@@ -259,6 +265,8 @@ def run_teacher(
 
     per_seq_latency_ms: List[float] = []
     total_start = time.time()
+    sampler = GPUUtilSampler(interval_sec=0.5)
+    sampler.start()
 
     label_cfg = label_thresholds or {}
     cos_tau = float(label_cfg.get("cosine_tau", 0.97))
@@ -275,6 +283,10 @@ def run_teacher(
         step_dl2_means: List[float] = []
         step_kl_means: List[float] = []
         step_ent_means: List[float] = []
+        step_dl2_norm_means: List[float] = []
+        prompt_mse: List[float] = []
+        stability_counter: Optional[np.ndarray] = None
+        stability_max: Optional[np.ndarray] = None
         # Per-layer accumulation for mean and IQR
         layer_step_values_cos: Dict[Tuple[int, int], np.ndarray] = {}
         layer_step_values_dl2: Dict[Tuple[int, int], np.ndarray] = {}
@@ -310,15 +322,32 @@ def run_teacher(
                 ent = obs.entropy
                 margin = obs.margin
                 step_frac = obs.step_frac
+                dl2_norm = obs.delta_l2_norm
                 # Record oracle skip ratio independent of feature dumping
-                if oracle_eval and not dump_features_dir:
-                    labels_oracle = ((cos >= cos_tau) & (dl2 <= dl2_rho) & (kl <= kl_max)).astype(np.float32)
-                    oracle_ratios.append(float(np.mean(labels_oracle)))
+                labels = ((cos >= cos_tau) & (dl2 <= dl2_rho) & (kl <= kl_max)).astype(np.float32)
+                oracle_ratios.append(float(np.mean(labels)))
                 step_cos_means.append(float(np.mean(cos)))
                 step_dl2_means.append(float(np.mean(dl2)))
                 step_kl_means.append(float(np.mean(kl)))
                 step_ent_means.append(float(np.mean(ent)))
+                step_dl2_norm_means.append(float(np.mean(dl2_norm)))
                 cos_hist_samples.extend(cos.flatten().tolist())
+                dl2_hist_samples.extend(dl2.flatten().tolist())
+                dl2_norm_hist_samples.extend(dl2_norm.flatten().tolist())
+                if stability_counter is None or stability_counter.shape[0] != labels.shape[0]:
+                    stability_counter = np.zeros_like(labels, dtype=np.int32)
+                    stability_max = np.zeros_like(labels, dtype=np.int32)
+                stable_mask = labels.astype(bool)
+                stability_counter[stable_mask] += 1
+                stability_counter[~stable_mask] = 0
+                if stability_max is not None:
+                    np.maximum(stability_max, stability_counter, out=stability_max)
+                layer_mse_values: List[float] = []
+                for h_now, h_prev in zip(out.hidden_by_layer, prev_hidden):
+                    diff = h_now - h_prev
+                    layer_mse_values.append(float(np.mean(np.square(diff))))
+                if layer_mse_values:
+                    prompt_mse.append(float(np.mean(layer_mse_values)))
                 # Save per-layer token vectors for IQR
                 for li, (h_now, h_prev) in enumerate(zip(out.hidden_by_layer, prev_hidden)):
                     # Compute per-token layer-wise metrics (masked)
@@ -359,7 +388,6 @@ def run_teacher(
                         ],
                         axis=-1,
                     ).astype(np.float32)
-                    labels = ((cos >= cos_tau) & (dl2 <= dl2_rho) & (kl <= kl_max)).astype(np.float32)
                     feature_blocks.append(features.reshape(-1, features.shape[-1]))
                     feature_labels.append(labels.reshape(-1))
                     shape = labels.reshape(-1).shape
@@ -371,8 +399,6 @@ def run_teacher(
                         axis=-1,
                     )
                     feature_meta.append(meta)
-                    if oracle_eval:
-                        oracle_ratios.append(float(np.mean(labels)))
             # Snapshot prev strictly after metrics (prevent view overwrite)
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
             prev_logits = out.logits.copy()
@@ -382,6 +408,10 @@ def run_teacher(
         dl2_means.append(step_dl2_means)
         kl_means.append(step_kl_means)
         ent_means.append(step_ent_means)
+        dl2_norm_means.append(step_dl2_norm_means)
+        mse_series.append(prompt_mse)
+        if stability_max is not None:
+            stability_lengths.extend(int(x) for x in stability_max.tolist())
         per_seq_latency_ms.append((time.time() - seq_start) * 1000.0)
 
     save_jsonl(os.path.join(out_dirs["runs"], f"teacher_{timestamp}.jsonl"), aggregates)
@@ -451,9 +481,14 @@ def run_teacher(
                         f.write(f"{b},{t},dl2,{np.mean(v):.6f},{np.percentile(v,25):.6f},{np.percentile(v,75):.6f}\n")
     if len(cos_hist_samples) > 0:
         save_hist(np.array(cos_hist_samples), os.path.join(out_dirs["figures"], f"teacher_cosine_hist_{timestamp}.png"), title="Cosine similarity histogram")
+    if len(dl2_hist_samples) > 0:
+        save_hist(np.array(dl2_hist_samples), os.path.join(out_dirs["figures"], f"teacher_dl2_hist_{timestamp}.png"), title="ΔL2 histogram")
+    if len(dl2_norm_hist_samples) > 0:
+        save_hist(np.array(dl2_norm_hist_samples), os.path.join(out_dirs["figures"], f"teacher_dl2norm_hist_{timestamp}.png"), title="ΔL2 normalized histogram")
 
     total_time_s = max(1e-6, time.time() - total_start)
-    gpu = query_gpu_utilization() or {}
+    sampler.stop()
+    gpu = sampler.metrics or (query_gpu_utilization() or {})
     summary = {
         "mode": "teacher",
         "num_prompts": len(prompts),
@@ -467,6 +502,27 @@ def run_teacher(
     }
     with open(os.path.join(out_dirs["runs"], f"teacher_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+
+    try:
+        from src.viz.rich import render_teacher_suite
+
+        render_teacher_suite(
+            out_dirs["figures"],
+            timestamp,
+            cos_means,
+            dl2_means,
+            kl_means,
+            ent_means,
+            dl2_norm_means,
+            cos_hist_samples,
+            dl2_hist_samples,
+            dl2_norm_hist_samples,
+            stability_lengths,
+            per_seq_latency_ms,
+            mse_series,
+        )
+    except Exception:
+        pass
 
     if dump_features_dir and feature_blocks:
         os.makedirs(dump_features_dir, exist_ok=True)
@@ -501,6 +557,7 @@ def run_rule_gate(
 
     aggregates: List[Dict] = []
     savings_ratios: List[float] = []
+    freeze_ratios_by_step: Dict[int, List[float]] = defaultdict(list)
 
     gate = RuleGate(cfg)
     calibrator = ConformalRiskCalibrator(delta=risk_delta, initial_quantile=0.60)
@@ -515,6 +572,8 @@ def run_rule_gate(
     risk_threshold_history: List[float] = []
     delta_violation_history: List[float] = []
     total_start = time.time()
+    sampler = GPUUtilSampler(interval_sec=0.5)
+    sampler.start()
 
     for prompt in prompts:
         state = engine.encode_prompt(prompt)
@@ -598,8 +657,9 @@ def run_rule_gate(
             baseline_ops += (num_layers_seen * seq_len)
             actual_ops += (num_layers_seen * (seq_len - frozen_tokens))
             skip_stats_rows.append(f"{t},{seq_len},{frozen_tokens},{frozen_ratio:.6f},{num_layers_seen},0")
+            freeze_ratios_by_step[t].append(frozen_ratio)
 
-            risk_threshold = calibrator.threshold
+            risk_threshold = calibrator.effective_threshold(risk_scores)
             risk_threshold_history.append(risk_threshold)
             if risk_scores.size > 0:
                 delta_violation_history.append(float(np.mean(risk_scores > risk_threshold)))
@@ -659,8 +719,24 @@ def run_rule_gate(
     if len(savings_ratios) > 0:
         save_hist(np.array(savings_ratios), os.path.join(out_dirs["figures"], f"rule_gate_savings_hist_{timestamp}.png"), title="Token compute savings ratio")
 
+    try:
+        from src.viz.rich import render_rule_gate_suite
+
+        render_rule_gate_suite(
+            out_dirs["figures"],
+            timestamp,
+            savings_ratios,
+            freeze_ratios_by_step,
+            risk_threshold_history,
+            delta_violation_history,
+            per_seq_latency_ms,
+        )
+    except Exception:
+        pass
+
     total_time_s = max(1e-6, time.time() - total_start)
-    gpu = query_gpu_utilization() or {}
+    sampler.stop()
+    gpu = sampler.metrics or (query_gpu_utilization() or {})
     summary = {
         "mode": "rule_gate",
         "num_prompts": len(prompts),
@@ -698,10 +774,13 @@ def run_learned_gate(
     aggregates: List[Dict] = []
     savings_ratios: List[float] = []
     prob_samples: List[float] = []
+    freeze_ratios_by_step: Dict[int, List[float]] = defaultdict(list)
 
     per_seq_latency_ms: List[float] = []
     final_consistency: List[float] = []
     total_start = time.time()
+    sampler = GPUUtilSampler(interval_sec=0.5)
+    sampler.start()
     calibrator = ConformalRiskCalibrator(delta=risk_delta, initial_quantile=0.60)
     budget_controller = BudgetController(budget_fraction=budget_fraction)
     risk_threshold_history: List[float] = []
@@ -736,6 +815,13 @@ def run_learned_gate(
             prev_logits_snapshot = prev_logits.copy()
 
             out = engine.step(state, t, compute_mask=mask_to_use)
+
+            seq_len = out.logits.shape[0]
+            computed_tokens = seq_len if mask_to_use is None else int(np.sum(mask_to_use))
+            total_tokens_computed += computed_tokens
+            total_tokens_possible += seq_len
+            if seq_len > 0:
+                freeze_ratios_by_step[t].append(1.0 - (computed_tokens / float(seq_len)))
 
             obs = compute_token_observables(
                 out.hidden_by_layer,
@@ -781,7 +867,7 @@ def run_learned_gate(
                 ],
                 axis=-1,
             ).astype(np.float32)
-            risk_threshold = calibrator.threshold
+            risk_threshold = calibrator.effective_threshold(risk_scores)
             risk_threshold_history.append(risk_threshold)
             if risk_scores.size > 0:
                 delta_violation_history.append(float(np.mean(risk_scores > risk_threshold)))
@@ -825,8 +911,25 @@ def run_learned_gate(
     if prob_samples:
         save_hist(np.array(prob_samples), os.path.join(out_dirs["figures"], f"learned_gate_prob_hist_{timestamp}.png"), title="Learned gate freeze probability")
 
+    try:
+        from src.viz.rich import render_learned_gate_suite
+
+        render_learned_gate_suite(
+            out_dirs["figures"],
+            timestamp,
+            savings_ratios,
+            freeze_ratios_by_step,
+            risk_threshold_history,
+            delta_violation_history,
+            per_seq_latency_ms,
+            prob_samples,
+        )
+    except Exception:
+        pass
+
     total_time_s = max(1e-6, time.time() - total_start)
-    gpu = query_gpu_utilization() or {}
+    sampler.stop()
+    gpu = sampler.metrics or (query_gpu_utilization() or {})
     summary = {
         "mode": "learned_gate",
         "num_prompts": len(prompts),
@@ -860,6 +963,10 @@ def run_adaptive(
     calibrator = ConformalRiskCalibrator(delta=risk_delta)
     per_seq_latency_ms: List[float] = []
     skip_estimates: List[float] = []
+    lte_traces: List[List[float]] = []
+    risk_traces: List[List[float]] = []
+    stride_traces: List[List[int]] = []
+    lte_threshold_traces: List[List[float]] = []
     total_start = time.time()
 
     for prompt in prompts:
@@ -868,6 +975,11 @@ def run_adaptive(
         prev_logits: Optional[np.ndarray] = None
         seq_start = time.time()
         effective_steps = 0.0
+        prompt_lte: List[float] = []
+        prompt_risk: List[float] = []
+        prompt_stride: List[int] = []
+        prompt_lte_thresholds: List[float] = []
+        lte_history: List[float] = []
 
         for t in range(num_steps):
             out = engine.step(state, t, compute_mask=None)
@@ -875,6 +987,7 @@ def run_adaptive(
                 prev_hidden = [h.copy() for h in out.hidden_by_layer]
                 prev_logits = out.logits.copy()
                 effective_steps += 1.0
+                prompt_stride.append(scheduler.stride)
                 continue
 
             obs = compute_token_observables(
@@ -888,8 +1001,22 @@ def run_adaptive(
             )
             risk_scores = compute_risk_score(obs.cosine_norm, obs.delta_l2_norm, obs.kl)
             calibrator.register(risk_scores, unsafe_mask=None)
-            lte_value = float(np.mean(np.abs(obs.delta_l2_norm)))
-            scheduler.observe(lte_value, float(np.mean(risk_scores)))
+            risk_threshold = calibrator.effective_threshold(risk_scores)
+            lte_raw = float(np.mean(np.abs(obs.delta_l2)))
+            lte_norm = float(np.mean(np.abs(obs.delta_l2_norm)))
+            lte_value = lte_norm if scheduler_cfg.use_normalized_lte else lte_raw
+            risk_metric = float(np.quantile(risk_scores.astype(np.float64), 0.90, method="higher")) if risk_scores.size > 0 else 0.0
+            lte_history.append(lte_value)
+            if scheduler_cfg.use_normalized_lte or scheduler_cfg.lte_eps > 1.0:
+                lte_threshold = float(scheduler_cfg.lte_eps)
+            else:
+                quantile = float(np.clip(scheduler_cfg.lte_eps, 0.0, 1.0))
+                lte_threshold = float(np.quantile(np.asarray(lte_history, dtype=np.float32), quantile))
+            scheduler.observe(lte_value, lte_threshold, risk_metric, risk_threshold)
+            prompt_lte.append(lte_value)
+            prompt_risk.append(risk_metric)
+            prompt_stride.append(scheduler.stride)
+            prompt_lte_thresholds.append(lte_threshold)
             stride = scheduler.stride
             effective_steps += 1.0 / max(1, stride)
 
@@ -900,6 +1027,10 @@ def run_adaptive(
         nominal_steps = float(num_steps)
         skip_estimates.append(max(0.0, 1.0 - (effective_steps / nominal_steps)))
         scheduler.reset()
+        lte_traces.append(prompt_lte)
+        risk_traces.append(prompt_risk)
+        stride_traces.append(prompt_stride)
+        lte_threshold_traces.append(prompt_lte_thresholds)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     # Simple visuals: histogram of per-sequence estimated skip ratios
@@ -907,6 +1038,20 @@ def run_adaptive(
         from src.viz.plots import save_hist
         if skip_estimates:
             save_hist(np.array(skip_estimates), os.path.join(out_dirs["figures"], f"adaptive_skip_hist_{timestamp}.png"), title="Adaptive estimated skip ratio per sequence")
+    except Exception:
+        pass
+    try:
+        from src.viz.rich import render_adaptive_suite
+        render_adaptive_suite(
+            out_dirs["figures"],
+            timestamp,
+            skip_estimates,
+            lte_traces,
+            risk_traces,
+            stride_traces,
+            lte_threshold_traces,
+            scheduler_cfg,
+        )
     except Exception:
         pass
     summary = {

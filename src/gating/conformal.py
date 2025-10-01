@@ -24,7 +24,13 @@ class ConformalRiskCalibrator:
 
     def __post_init__(self) -> None:
         self._unsafe_scores: Deque[float] = deque(maxlen=self.window_size)
-        self._quantile: float = float(self.initial_quantile)
+        # ``initial_quantile`` is expressed as a probability in [0, 1]. Store a
+        # clamped copy so we can safely reuse it for fallback bootstrapping.
+        self._initial_quantile = float(np.clip(self.initial_quantile, 0.0, 1.0))
+        # ``_quantile`` tracks the calibrated risk value. ``inf`` denotes that no
+        # samples have been registered yet, allowing callers to fall back to a
+        # bootstrap estimate derived from the current batch of scores.
+        self._quantile: float = float("inf")
 
     def register(self, scores: np.ndarray, unsafe_mask: Optional[np.ndarray] = None) -> None:
         """Register a batch of scores.
@@ -54,23 +60,54 @@ class ConformalRiskCalibrator:
         self._recompute_quantile()
 
     def _recompute_quantile(self) -> None:
-        if len(self._unsafe_scores) < self.min_size:
+        count = len(self._unsafe_scores)
+        if count == 0:
+            self._quantile = float("inf")
             return
-        # Conformal quantile (empirical upper quantile with +1 correction)
+
         scores = np.fromiter(self._unsafe_scores, dtype=np.float64)
-        n = scores.size
-        rank = int(np.ceil((n + 1) * (1.0 - self.delta)))
-        rank = np.clip(rank, 1, n)
-        sorted_scores = np.sort(scores)
-        self._quantile = float(sorted_scores[rank - 1])
+        target_prob = float(1.0 - self.delta)
+        if count < self.min_size:
+            target_prob = max(target_prob, self._initial_quantile)
+        target_prob = float(np.clip(target_prob, 0.0, 1.0))
+
+        if target_prob >= 1.0:
+            self._quantile = float(np.max(scores))
+        else:
+            # ``method='higher'`` mirrors the +1 conformal correction.
+            self._quantile = float(np.quantile(scores, target_prob, method="higher"))
 
     @property
     def threshold(self) -> float:
         return float(self._quantile)
 
+    @property
+    def is_ready(self) -> bool:
+        return len(self._unsafe_scores) >= self.min_size and not np.isinf(self._quantile)
+
+    def effective_threshold(self, candidate_scores: Optional[np.ndarray] = None) -> float:
+        """Return the calibrated threshold, bootstrapping if needed.
+
+        When no unsafe samples have been registered yet we fall back to a
+        quantile computed from ``candidate_scores`` (typically the current
+        batch). This keeps the downstream gates from becoming overly
+        conservative in early steps while still honouring the configured
+        ``initial_quantile``.
+        """
+
+        if not np.isinf(self._quantile):
+            return float(self._quantile)
+        if candidate_scores is None or candidate_scores.size == 0:
+            return float(self._quantile)
+        prob = self._initial_quantile if self._initial_quantile > 0.0 else 0.5
+        prob = float(np.clip(prob, 0.0, 1.0))
+        if prob >= 1.0:
+            return float(np.max(candidate_scores))
+        return float(np.quantile(candidate_scores.astype(np.float64), prob, method="higher"))
+
     def reset(self) -> None:
         self._unsafe_scores.clear()
-        self._quantile = float(self.initial_quantile)
+        self._quantile = float("inf")
 
 
 def compute_risk_score(
@@ -94,4 +131,3 @@ def compute_risk_score(
         1.0 - cosine,
     ], axis=0)
     return np.max(risk_components, axis=0) + float(epsilon)
-
