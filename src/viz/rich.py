@@ -171,6 +171,22 @@ def render_teacher_suite(
                     plt.savefig(out_path)
                     plt.close()
 
+            # Layer-wise average MSE line plot (collapse across steps)
+            layer_means = np.nanmean(matrix, axis=1)
+            if np.any(np.isfinite(layer_means)):
+                finite_mask = np.isfinite(layer_means)
+                xs = [layer_ids[i] for i, flag in enumerate(finite_mask) if flag]
+                ys = [layer_means[i] for i, flag in enumerate(finite_mask) if flag]
+                if xs and ys:
+                    _save_line(
+                        xs,
+                        ys,
+                        os.path.join(figures_dir, f"teacher_mse_layers_line_{timestamp}.png"),
+                        "Mean layer MSE",
+                        "layer",
+                        "MSE",
+                    )
+
     # Entropy curve for reference
     ent_arr = _stack_series(ent_means)
     if ent_arr.size:
