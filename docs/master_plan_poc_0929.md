@@ -204,6 +204,7 @@ outputs_root: /path/to/outputs
 * `reports/artifacts/teacher_outputs/*.jsonl` → **final outputs** per prompt
 * `reports/artifacts/features/teacher_features_*.npz` → token features (for P3) including σₜ, normalized deltas, attention communities
 * `reports/runs/teacher_summary.json` → latency/throughput/p50/p90, GPU mem, CIs, true FLOPs, LTE stats
+* `reports/figures/teacher_mse_layers_{timestamp}.png` & `teacher_mse_layers_line_{timestamp}.png` → **per-layer MSE heatmap + layer trend line** (new in 2025-10 update)
 
 ### 7.3 **Correct** consistency metrics (fix for `-1.0`)
 
@@ -218,12 +219,13 @@ outputs_root: /path/to/outputs
 ### 7.4 Visualizations (richer set)
 
 1. **Layer×Step heatmaps**: cosine (mean ± IQR), ΔL2, logit-KL, LTE residuals
-2. **Histograms & violin plots**: cosine / ΔL2 (raw & σₜ-normalized) across all (L, t, i)
-3. **Token stability lengths**: distribution of **max consecutive stable steps** (by τ/ρ & margin γ)
-4. **Per-layer time breakdown**: stacked bars of attention/FFN/other + true FLOPs
-5. **Centrality/community vs “freeze probability”** scatter (overlay P2/P3 decisions later)
-6. **Latency tails**: p50/p90 density plots per mode (Teacher later vs P2/P3)
-7. **Compute-AUC & skip-regret** curves derived from sweep over thresholds
+2. **Layer MSE visuals**: heatmap across steps + **layer-axis line plot** of mean MSE (new)
+3. **Histograms & violin plots**: cosine / ΔL2 (raw & σₜ-normalized) across all (L, t, i)
+4. **Token stability lengths**: distribution of **max consecutive stable steps** (by τ/ρ & margin γ)
+5. **Per-layer time breakdown**: stacked bars of attention/FFN/other + true FLOPs
+6. **Centrality/community vs “freeze probability”** scatter (overlay P2/P3 decisions later)
+7. **Latency tails**: p50/p90 density plots per mode (Teacher later vs P2/P3)
+8. **Compute-AUC & skip-regret** curves derived from sweep over thresholds
 
 ---
 
@@ -446,15 +448,16 @@ Compare **Teacher**, **RuleGate**, **LearnedGate**, **Adaptive**, **Combined (P2
 **Auto-generated figures per run**
 
 1. **Layer×Step heatmaps**: cosine, ΔL2, logit-KL (mean ± IQR)
-2. **Cosine/ΔL2 histograms** + **violin plots** (raw & σₜ-normalized)
-3. **Token stability length** distributions
-4. **Per-layer time breakdown** (Teacher vs P2/P3) incl. true FLOPs
-5. **Freeze maps** (fraction frozen by layer/step/community)
-6. **ROC/PR** (P3) + **calibration + conformal δ** curves
-7. **Latency tails** (p50/p90 density) & **skip-ratio CDFs**
-8. **Pareto fronts** (Latency vs Quality) with **95% CIs**
-9. **Compute-AUC & skip-regret** sweeps across thresholds/budgets
-10. **Failure case gallery**: diffs in outputs + attention centrality overlays + risk heatmaps
+2. **Layer MSE suite**: step heatmap + layer-axis line chart (teacher freeze targeting)
+3. **Cosine/ΔL2 histograms** + **violin plots** (raw & σₜ-normalized)
+4. **Token stability length** distributions
+5. **Per-layer time breakdown** (Teacher vs P2/P3) incl. true FLOPs
+6. **Freeze maps** (fraction frozen by layer/step/community)
+7. **ROC/PR** (P3) + **calibration + conformal δ** curves
+8. **Latency tails** (p50/p90 density) & **skip-ratio CDFs**
+9. **Pareto fronts** (Latency vs Quality) with **95% CIs**
+10. **Compute-AUC & skip-regret** sweeps across thresholds/budgets
+11. **Failure case gallery**: diffs in outputs + attention centrality overlays + risk heatmaps
 
 **Tables (CSV + dashboard)**
 
