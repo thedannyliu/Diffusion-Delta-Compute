@@ -1,15 +1,38 @@
 from __future__ import annotations
 
-import os
 import subprocess
 import time
 from contextlib import contextmanager
 from typing import Dict, Optional
+import threading
 
 
 def query_gpu_utilization() -> Optional[Dict[str, float]]:
+    """Best-effort GPU utilization query.
+
+    Tries NVML via pynvml first, then falls back to `nvidia-smi` query. Returns None if both fail.
+    """
+    # Try NVML
     try:
-        # Use nvidia-smi to fetch utilization for GPU 0
+        import pynvml  # type: ignore
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        out = {
+            "util_gpu": float(util.gpu),
+            "util_mem": float(util.memory),
+            "mem_used": float(mem.used) / (1024.0 * 1024.0),
+            "mem_total": float(mem.total) / (1024.0 * 1024.0),
+        }
+        pynvml.nvmlShutdown()
+        return out
+    except Exception:
+        pass
+
+    # Fallback to nvidia-smi --query
+    try:
         out = subprocess.check_output([
             "nvidia-smi",
             "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total",
@@ -26,6 +49,46 @@ def query_gpu_utilization() -> Optional[Dict[str, float]]:
         return None
 
 
+class GPUUtilSampler:
+    """Background sampler for GPU utilization using nvidia-smi dmon or query.
+
+    Periodically updates a shared dict with keys: util_gpu, util_mem, mem_used, mem_total.
+    """
+
+    def __init__(self, interval_sec: float = 0.5) -> None:
+        self.interval_sec = float(interval_sec)
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+        self._sum: Dict[str, float] = {}
+        self._count: int = 0
+        self.metrics: Dict[str, float] = {}
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            data = query_gpu_utilization()
+            if data is not None:
+                self._count += 1
+                for key, value in data.items():
+                    self._sum[key] = self._sum.get(key, 0.0) + float(value)
+                self.metrics = {k: self._sum[k] / float(self._count) for k in self._sum}
+            time.sleep(self.interval_sec)
+
+    def start(self) -> None:
+        if self._thread is None:
+            self._stop.clear()
+            self._sum.clear()
+            self._count = 0
+            self.metrics = {}
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+
+    def stop(self) -> None:
+        if self._thread is not None:
+            self._stop.set()
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+
 @contextmanager
 def latency_timer() -> Dict[str, float]:
     start = time.time()
@@ -34,5 +97,3 @@ def latency_timer() -> Dict[str, float]:
         yield info
     finally:
         info["ms"] = (time.time() - start) * 1000.0
-
-

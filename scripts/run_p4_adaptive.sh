@@ -7,22 +7,20 @@ if [[ $# -gt 0 ]]; then
   CONFIG_PATH=$1
   shift
 else
-  CONFIG_PATH="$PROJECT_ROOT/configs/p2_smoke.yaml"
+  CONFIG_PATH="$PROJECT_ROOT/configs/p4_smoke.yaml"
 fi
 
 ENGINE=${ENGINE:-}
 OUT_DIR=${OUT_DIR:-}
 TASKS_CFG=${TASKS_CFG:-}
 PATHS_CFG=${PATHS_CFG:-}
-THRESHOLDS_CFG=${THRESHOLDS_CFG:-}
-PROFILE=${PROFILE:-}
-DATASET_KEY=${DATASET_KEY:-}
 RISK_DELTA=${RISK_DELTA:-}
-BUDGET_FRACTION=${BUDGET_FRACTION:-}
-LAYER_M=${LAYER_M:-}
-MODE=rule_gate
+LTE_EPS=${LTE_EPS:-}
+LTE_MIN_CONSEC=${LTE_MIN_CONSEC:-}
+MAX_STRIDE=${MAX_STRIDE:-}
+ADAPTIVE_BUDGET=${ADAPTIVE_BUDGET:-}
 
-CLI_ARGS=("--mode" "$MODE" "--config" "$CONFIG_PATH")
+CLI_ARGS=("--mode" "adaptive" "--config" "$CONFIG_PATH")
 if [[ -n "$ENGINE" ]]; then
   CLI_ARGS+=("--engine" "$ENGINE")
 fi
@@ -35,28 +33,25 @@ fi
 if [[ -n "$PATHS_CFG" ]]; then
   CLI_ARGS+=("--paths_cfg" "$PATHS_CFG")
 fi
-if [[ -n "$THRESHOLDS_CFG" ]]; then
-  CLI_ARGS+=("--thresholds_cfg" "$THRESHOLDS_CFG")
-fi
-if [[ -n "$PROFILE" ]]; then
-  CLI_ARGS+=("--profile" "$PROFILE")
-fi
-if [[ -n "$DATASET_KEY" ]]; then
-  CLI_ARGS+=("--dataset" "$DATASET_KEY")
-fi
 if [[ -n "$RISK_DELTA" ]]; then
   CLI_ARGS+=("--risk_delta" "$RISK_DELTA")
 fi
-if [[ -n "$BUDGET_FRACTION" ]]; then
-  CLI_ARGS+=("--budget_fraction" "$BUDGET_FRACTION")
+if [[ -n "$LTE_EPS" ]]; then
+  CLI_ARGS+=("--lte_eps" "$LTE_EPS")
 fi
-if [[ -n "$LAYER_M" ]]; then
-  CLI_ARGS+=("--layer_recompute_M" "$LAYER_M")
+if [[ -n "$LTE_MIN_CONSEC" ]]; then
+  CLI_ARGS+=("--lte_min_consec" "$LTE_MIN_CONSEC")
+fi
+if [[ -n "$MAX_STRIDE" ]]; then
+  CLI_ARGS+=("--max_stride" "$MAX_STRIDE")
+fi
+if [[ -n "$ADAPTIVE_BUDGET" ]]; then
+  CLI_ARGS+=("--adaptive_budget" "$ADAPTIVE_BUDGET")
 fi
 
 CLI_ARGS+=("$@")
 
-echo "[P2] Running rule-based gate with config: $CONFIG_PATH (python=$PYTHON)"
+echo "[P4] Running adaptive stride scheduling with config: $CONFIG_PATH (python=$PYTHON)"
 pushd "$PROJECT_ROOT" >/dev/null
 "$PYTHON" -m src.run "${CLI_ARGS[@]}"
 popd >/dev/null

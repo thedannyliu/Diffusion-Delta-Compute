@@ -33,6 +33,13 @@ fi
 
 ENGINE=${ENGINE:-}
 OUT_DIR=${OUT_DIR:-}
+TASKS_CFG=${TASKS_CFG:-}
+PATHS_CFG=${PATHS_CFG:-}
+THRESHOLDS_CFG=${THRESHOLDS_CFG:-}
+PROFILE=${PROFILE:-}
+DATASET_KEY=${DATASET_KEY:-}
+RISK_DELTA=${RISK_DELTA:-}
+BUDGET_FRACTION=${BUDGET_FRACTION:-}
 WEIGHTS_OUT=${WEIGHTS_OUT:-$PROJECT_ROOT/models/gates/learned_gate_latest.npz}
 TRAIN_EPOCHS=${TRAIN_EPOCHS:-8}
 TRAIN_BATCH=${TRAIN_BATCH:-1024}
@@ -78,6 +85,27 @@ if [[ -n "$ENGINE" ]]; then
 fi
 if [[ -n "$OUT_DIR" ]]; then
   CLI_ARGS+=("--out_dir" "$OUT_DIR")
+fi
+if [[ -n "$TASKS_CFG" ]]; then
+  CLI_ARGS+=("--tasks_cfg" "$TASKS_CFG")
+fi
+if [[ -n "$PATHS_CFG" ]]; then
+  CLI_ARGS+=("--paths_cfg" "$PATHS_CFG")
+fi
+if [[ -n "$THRESHOLDS_CFG" ]]; then
+  CLI_ARGS+=("--thresholds_cfg" "$THRESHOLDS_CFG")
+fi
+if [[ -n "$PROFILE" ]]; then
+  CLI_ARGS+=("--profile" "$PROFILE")
+fi
+if [[ -n "$DATASET_KEY" ]]; then
+  CLI_ARGS+=("--dataset" "$DATASET_KEY")
+fi
+if [[ -n "$RISK_DELTA" ]]; then
+  CLI_ARGS+=("--risk_delta" "$RISK_DELTA")
+fi
+if [[ -n "$BUDGET_FRACTION" ]]; then
+  CLI_ARGS+=("--budget_fraction" "$BUDGET_FRACTION")
 fi
 CLI_ARGS+=("$@")
 

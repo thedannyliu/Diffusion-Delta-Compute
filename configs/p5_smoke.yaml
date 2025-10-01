@@ -1,0 +1,5 @@
+phase: P5
+engine: mock
+num_prompts: 8
+num_steps: 12
+task: synthetic

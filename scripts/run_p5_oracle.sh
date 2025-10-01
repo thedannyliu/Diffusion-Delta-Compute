@@ -7,17 +7,15 @@ if [[ $# -gt 0 ]]; then
   CONFIG_PATH=$1
   shift
 else
-  CONFIG_PATH="$PROJECT_ROOT/configs/p1_smoke.yaml"
+  CONFIG_PATH="$PROJECT_ROOT/configs/p5_smoke.yaml"
 fi
 
 ENGINE=${ENGINE:-}
 OUT_DIR=${OUT_DIR:-}
 TASKS_CFG=${TASKS_CFG:-}
 PATHS_CFG=${PATHS_CFG:-}
-ORACLE_EVAL=${ORACLE_EVAL:-}
-MODE=teacher
 
-CLI_ARGS=("--mode" "$MODE" "--config" "$CONFIG_PATH")
+CLI_ARGS=("--mode" "oracle" "--config" "$CONFIG_PATH")
 if [[ -n "$ENGINE" ]]; then
   CLI_ARGS+=("--engine" "$ENGINE")
 fi
@@ -30,13 +28,10 @@ fi
 if [[ -n "$PATHS_CFG" ]]; then
   CLI_ARGS+=("--paths_cfg" "$PATHS_CFG")
 fi
-if [[ -n "$ORACLE_EVAL" ]]; then
-  CLI_ARGS+=("--oracle_eval")
-fi
 
 CLI_ARGS+=("$@")
 
-echo "[P1] Running teacher traces with config: $CONFIG_PATH (python=$PYTHON)"
+echo "[P5] Running oracle skip/freeze analysis with config: $CONFIG_PATH (python=$PYTHON)"
 pushd "$PROJECT_ROOT" >/dev/null
 "$PYTHON" -m src.run "${CLI_ARGS[@]}"
 popd >/dev/null

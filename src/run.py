@@ -2,6 +2,8 @@ import argparse
 import json
 import os
 import time
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -24,8 +26,12 @@ from src.probes.metrics import (
 )
 from src.gating.rule_gate import RuleGate, RuleGateConfig, StepGateResult
 from src.gating.learned_gate import LearnedGate, LearnedGateConfig, LearnedGateWeights
+from src.gating.conformal import ConformalRiskCalibrator, compute_risk_score
+from src.gating.budget import BudgetController
+from src.gating.adaptive import AdaptiveScheduler, AdaptiveSchedulerConfig
+from src.gating.rollback import RollbackBuffer
 from src.eval.tasks import load_wikitext2, load_lambada_openai, load_gsm8k_tiny
-from src.utils.profile import query_gpu_utilization
+from src.utils.profile import query_gpu_utilization, GPUUtilSampler
 from src.utils.config import load_yaml, ensure_output_dirs, save_manifest
 
 try:  # Optional dependency; scripts can run without W&B
@@ -36,7 +42,12 @@ except Exception:  # pragma: no cover - optional dependency guard
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Delta-Compute dLLM PoC runner")
-    parser.add_argument("--mode", type=str, choices=["teacher", "rule_gate", "learned_gate"], required=True)
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["teacher", "rule_gate", "learned_gate", "adaptive", "oracle", "baselines"],
+        required=True,
+    )
     parser.add_argument("--engine", type=str, default=None, choices=["mock", "d2f"], help="Engine backend")
     parser.add_argument("--out_dir", type=str, default=None, help="Output directory for runs")
     parser.add_argument("--num_prompts", type=int, default=None)
@@ -53,6 +64,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--lora_path", type=str, default=None)
     parser.add_argument("--task", type=str, default=None, choices=["synthetic", "wikitext", "lambada", "gsm8k"], help="Prompt source")
+    parser.add_argument("--tasks_cfg", type=str, default=None, help="YAML config for tasks")
+    parser.add_argument("--paths_cfg", type=str, default=None, help="YAML config for data/model/output paths")
+    parser.add_argument("--thresholds_cfg", type=str, default=None, help="YAML config for gating thresholds")
+    parser.add_argument("--profile", type=str, default=None, help="Threshold profile name (balanced/aggressive/...)")
+    parser.add_argument("--dataset", type=str, default=None, help="Dataset key within thresholds config")
     parser.add_argument("--dump_features_dir", type=str, default=None, help="Directory to dump token-level features for training the learned gate")
     parser.add_argument("--label_cos_tau", type=float, default=None, help="Cosine threshold for positive labels when dumping features")
     parser.add_argument("--label_dl2_rho", type=float, default=None, help="ΔL2 threshold for positive labels when dumping features")
@@ -70,6 +86,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--watchdog_max_kl", type=float, default=None)
     parser.add_argument("--layer_recompute_M", type=int, default=None)
     parser.add_argument("--consistency_full_compute", action="store_true", help="Run full-compute baseline and compare outputs; write difference report")
+    parser.add_argument("--risk_delta", type=float, default=0.01, help="Target conformal δ bound")
+    parser.add_argument("--budget_fraction", type=float, default=1.0, help="Per-step compute budget as fraction of Teacher FLOPs")
+    parser.add_argument("--oracle_eval", action="store_true", help="When running Teacher, also compute oracle headroom metrics")
+    parser.add_argument("--lte_probe", type=str, default="euler", choices=["none", "euler", "heun"], help="LTE probing strategy")
+    parser.add_argument("--lte_eps", type=float, default=0.2, help="LTE tolerance for adaptive scheduler (interpreted in raw ΔL2 units by default)")
+    parser.add_argument("--lte_min_consec", type=int, default=2, help="Consecutive LTE acceptances before increasing stride")
+    parser.add_argument("--max_stride", type=int, default=4, help="Maximum adaptive stride")
+    parser.add_argument("--adaptive_budget", type=float, default=0.20, help="Adaptive total skip budget")
+    parser.add_argument("--sprt_alpha", type=float, default=0.005, help="SPRT Type I error")
+    parser.add_argument("--sprt_beta", type=float, default=0.005, help="SPRT Type II error")
     return parser.parse_args()
 
 
@@ -130,7 +156,43 @@ def save_jsonl(path: str, rows: List[Dict]) -> None:
             f.write(json.dumps(row) + "\n")
 
 
-FEATURE_NAMES = ("cosine", "delta_l2", "kl", "entropy", "margin", "step_frac")
+FEATURE_NAMES = (
+    "cosine",
+    "delta_l2",
+    "kl",
+    "entropy",
+    "margin",
+    "step_frac",
+    "sigma",
+    "cosine_norm",
+    "delta_l2_norm",
+    "risk_score",
+)
+
+
+@dataclass
+class TokenObservables:
+    cosine: np.ndarray
+    delta_l2: np.ndarray
+    kl: np.ndarray
+    entropy: np.ndarray
+    margin: np.ndarray
+    step_frac: np.ndarray
+    sigma: np.ndarray
+    cosine_norm: np.ndarray
+    delta_l2_norm: np.ndarray
+
+
+def sigma_for_step(aux: Optional[Dict], step_index: int, num_steps: int) -> float:
+    if aux and "sigma" in aux:
+        try:
+            return float(aux["sigma"])
+        except Exception:
+            pass
+    denom = max(1, num_steps - 1)
+    # Simple cosine schedule as placeholder when the engine does not report σ_t
+    ratio = float(step_index) / float(denom)
+    return float(max(1e-3, np.cos(ratio * np.pi / 2.0)))
 
 
 def compute_token_observables(
@@ -140,8 +202,9 @@ def compute_token_observables(
     prev_logits: np.ndarray,
     step_index: int,
     num_steps: int,
+    aux: Optional[Dict] = None,
     valid_mask: Optional[np.ndarray] = None,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> TokenObservables:
     cos = cosine_similarity_tokens(current_hidden, prev_hidden)
     dl2 = delta_l2_ratio_tokens(current_hidden, prev_hidden)
     kl = kl_divergence_tokens(current_logits, prev_logits)
@@ -154,7 +217,22 @@ def compute_token_observables(
         margin = margin[valid_mask]
     denom = max(1, num_steps - 1)
     step_frac = np.full_like(cos, fill_value=float(step_index) / float(denom), dtype=np.float32)
-    return cos, dl2, kl, entropy, margin, step_frac
+    sigma = float(sigma_for_step(aux, step_index, num_steps))
+    sigma_arr = np.full_like(cos, fill_value=sigma, dtype=np.float32)
+    sigma_safe = np.maximum(sigma_arr, 1e-3)
+    cos_norm = np.clip((cos + 1.0) / 2.0, 0.0, 1.0)
+    dl2_norm = dl2 / sigma_safe
+    return TokenObservables(
+        cosine=cos,
+        delta_l2=dl2,
+        kl=kl,
+        entropy=entropy,
+        margin=margin,
+        step_frac=step_frac,
+        sigma=sigma_arr,
+        cosine_norm=cos_norm,
+        delta_l2_norm=dl2_norm,
+    )
 
 
 def run_teacher(
@@ -164,6 +242,7 @@ def run_teacher(
     num_steps: int,
     dump_features_dir: Optional[str] = None,
     label_thresholds: Optional[Dict[str, float]] = None,
+    oracle_eval: bool = False,
 ) -> Optional[str]:
     from src.viz.plots import save_heatmap, save_hist
 
@@ -172,20 +251,29 @@ def run_teacher(
     dl2_means: List[List[float]] = []
     kl_means: List[List[float]] = []
     ent_means: List[List[float]] = []
+    dl2_norm_means: List[List[float]] = []
+    mse_series: List[List[float]] = []
     cos_hist_samples: List[float] = []
+    dl2_hist_samples: List[float] = []
+    dl2_norm_hist_samples: List[float] = []
+    stability_lengths: List[int] = []
 
     feature_blocks: List[np.ndarray] = []
     feature_labels: List[np.ndarray] = []
     feature_meta: List[np.ndarray] = []
+    oracle_ratios: List[float] = []
 
     per_seq_latency_ms: List[float] = []
     total_start = time.time()
+    sampler = GPUUtilSampler(interval_sec=0.5)
+    sampler.start()
 
     label_cfg = label_thresholds or {}
     cos_tau = float(label_cfg.get("cosine_tau", 0.97))
     dl2_rho = float(label_cfg.get("delta_l2_rho", 0.05))
     kl_max = float(label_cfg.get("kl_max", 0.01))
     timestamp = time.strftime("%Y%m%d_%H%M%S")
+    layer_step_mse: Dict[Tuple[int, int], List[float]] = defaultdict(list)
 
     for prompt_idx, prompt in enumerate(prompts):
         state = engine.encode_prompt(prompt)
@@ -196,6 +284,10 @@ def run_teacher(
         step_dl2_means: List[float] = []
         step_kl_means: List[float] = []
         step_ent_means: List[float] = []
+        step_dl2_norm_means: List[float] = []
+        prompt_mse: List[float] = []
+        stability_counter: Optional[np.ndarray] = None
+        stability_max: Optional[np.ndarray] = None
         # Per-layer accumulation for mean and IQR
         layer_step_values_cos: Dict[Tuple[int, int], np.ndarray] = {}
         layer_step_values_dl2: Dict[Tuple[int, int], np.ndarray] = {}
@@ -215,20 +307,50 @@ def run_teacher(
                         is_pad = (ids == pad_id) if pad_id != -1 else np.zeros_like(ids, dtype=bool)
                         is_special = np.array(special, dtype=bool) if special is not None else np.zeros_like(ids, dtype=bool)
                         valid_mask = ~(is_pad | is_special)
-                cos, dl2, kl, ent, margin, step_frac = compute_token_observables(
+                obs = compute_token_observables(
                     out.hidden_by_layer,
                     prev_hidden,
                     out.logits,
                     prev_logits,
                     t,
                     num_steps,
+                    aux=out.aux if isinstance(out.aux, dict) else None,
                     valid_mask=valid_mask,
                 )
+                cos = obs.cosine
+                dl2 = obs.delta_l2
+                kl = obs.kl
+                ent = obs.entropy
+                margin = obs.margin
+                step_frac = obs.step_frac
+                dl2_norm = obs.delta_l2_norm
+                # Record oracle skip ratio independent of feature dumping
+                labels = ((cos >= cos_tau) & (dl2 <= dl2_rho) & (kl <= kl_max)).astype(np.float32)
+                oracle_ratios.append(float(np.mean(labels)))
                 step_cos_means.append(float(np.mean(cos)))
                 step_dl2_means.append(float(np.mean(dl2)))
                 step_kl_means.append(float(np.mean(kl)))
                 step_ent_means.append(float(np.mean(ent)))
+                step_dl2_norm_means.append(float(np.mean(dl2_norm)))
                 cos_hist_samples.extend(cos.flatten().tolist())
+                dl2_hist_samples.extend(dl2.flatten().tolist())
+                dl2_norm_hist_samples.extend(dl2_norm.flatten().tolist())
+                if stability_counter is None or stability_counter.shape[0] != labels.shape[0]:
+                    stability_counter = np.zeros_like(labels, dtype=np.int32)
+                    stability_max = np.zeros_like(labels, dtype=np.int32)
+                stable_mask = labels.astype(bool)
+                stability_counter[stable_mask] += 1
+                stability_counter[~stable_mask] = 0
+                if stability_max is not None:
+                    np.maximum(stability_max, stability_counter, out=stability_max)
+                layer_mse_values: List[float] = []
+                for h_now, h_prev in zip(out.hidden_by_layer, prev_hidden):
+                    diff = h_now - h_prev
+                    layer_mse_values.append(float(np.mean(np.square(diff))))
+                if layer_mse_values:
+                    prompt_mse.append(float(np.mean(layer_mse_values)))
+                    for li, mse_value in enumerate(layer_mse_values):
+                        layer_step_mse[(li, t)].append(mse_value)
                 # Save per-layer token vectors for IQR
                 for li, (h_now, h_prev) in enumerate(zip(out.hidden_by_layer, prev_hidden)):
                     # Compute per-token layer-wise metrics (masked)
@@ -253,8 +375,22 @@ def run_teacher(
                 )
 
                 if dump_features_dir:
-                    features = np.stack([cos, dl2, kl, ent, margin, step_frac], axis=-1).astype(np.float32)
-                    labels = ((cos >= cos_tau) & (dl2 <= dl2_rho) & (kl <= kl_max)).astype(np.float32)
+                    risk_teacher = compute_risk_score(obs.cosine_norm, obs.delta_l2_norm, obs.kl)
+                    features = np.stack(
+                        [
+                            cos,
+                            dl2,
+                            kl,
+                            ent,
+                            margin,
+                            step_frac,
+                            obs.sigma,
+                            obs.cosine_norm,
+                            obs.delta_l2_norm,
+                            risk_teacher,
+                        ],
+                        axis=-1,
+                    ).astype(np.float32)
                     feature_blocks.append(features.reshape(-1, features.shape[-1]))
                     feature_labels.append(labels.reshape(-1))
                     shape = labels.reshape(-1).shape
@@ -275,7 +411,25 @@ def run_teacher(
         dl2_means.append(step_dl2_means)
         kl_means.append(step_kl_means)
         ent_means.append(step_ent_means)
+        dl2_norm_means.append(step_dl2_norm_means)
+        mse_series.append(prompt_mse)
+        if stability_max is not None:
+            stability_lengths.extend(int(x) for x in stability_max.tolist())
         per_seq_latency_ms.append((time.time() - seq_start) * 1000.0)
+
+    layer_mse_curves: Dict[int, List[float]] = {}
+    mse_steps: List[int] = list(range(1, num_steps)) if num_steps > 1 else []
+    if layer_step_mse and mse_steps:
+        layer_indices = sorted(set(li for li, _ in layer_step_mse.keys()))
+        for li in layer_indices:
+            series: List[float] = []
+            for step in mse_steps:
+                values = layer_step_mse.get((li, step))
+                if values:
+                    series.append(float(np.mean(values)))
+                else:
+                    series.append(float("nan"))
+            layer_mse_curves[li] = series
 
     save_jsonl(os.path.join(out_dirs["runs"], f"teacher_{timestamp}.jsonl"), aggregates)
     # Export layer×step mean and IQR to CSV
@@ -344,9 +498,14 @@ def run_teacher(
                         f.write(f"{b},{t},dl2,{np.mean(v):.6f},{np.percentile(v,25):.6f},{np.percentile(v,75):.6f}\n")
     if len(cos_hist_samples) > 0:
         save_hist(np.array(cos_hist_samples), os.path.join(out_dirs["figures"], f"teacher_cosine_hist_{timestamp}.png"), title="Cosine similarity histogram")
+    if len(dl2_hist_samples) > 0:
+        save_hist(np.array(dl2_hist_samples), os.path.join(out_dirs["figures"], f"teacher_dl2_hist_{timestamp}.png"), title="ΔL2 histogram")
+    if len(dl2_norm_hist_samples) > 0:
+        save_hist(np.array(dl2_norm_hist_samples), os.path.join(out_dirs["figures"], f"teacher_dl2norm_hist_{timestamp}.png"), title="ΔL2 normalized histogram")
 
     total_time_s = max(1e-6, time.time() - total_start)
-    gpu = query_gpu_utilization() or {}
+    sampler.stop()
+    gpu = sampler.metrics or (query_gpu_utilization() or {})
     summary = {
         "mode": "teacher",
         "num_prompts": len(prompts),
@@ -355,10 +514,34 @@ def run_teacher(
         "latency_ms_p50": float(np.percentile(per_seq_latency_ms, 50) if per_seq_latency_ms else 0.0),
         "latency_ms_p90": float(np.percentile(per_seq_latency_ms, 90) if per_seq_latency_ms else 0.0),
         "throughput_seq_per_s": float(len(prompts) / total_time_s),
+        "oracle_skip_ratio_mean": float(np.mean(oracle_ratios) if oracle_ratios else -1.0),
         **{f"gpu_{k}": v for k, v in gpu.items()},
     }
     with open(os.path.join(out_dirs["runs"], f"teacher_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
+
+    try:
+        from src.viz.rich import render_teacher_suite
+
+        render_teacher_suite(
+            out_dirs["figures"],
+            timestamp,
+            cos_means,
+            dl2_means,
+            kl_means,
+            ent_means,
+            dl2_norm_means,
+            cos_hist_samples,
+            dl2_hist_samples,
+            dl2_norm_hist_samples,
+            stability_lengths,
+            per_seq_latency_ms,
+            mse_series,
+            layer_mse_curves,
+            mse_steps,
+        )
+    except Exception:
+        pass
 
     if dump_features_dir and feature_blocks:
         os.makedirs(dump_features_dir, exist_ok=True)
@@ -385,21 +568,33 @@ def run_rule_gate(
     out_dirs: Dict[str, str],
     num_steps: int,
     cfg: RuleGateConfig,
+    risk_delta: float,
+    budget_fraction: float,
     consistency_check: bool = False,
 ) -> None:
     from src.viz.plots import save_hist
 
     aggregates: List[Dict] = []
     savings_ratios: List[float] = []
+    freeze_ratios_by_step: Dict[int, List[float]] = defaultdict(list)
 
     gate = RuleGate(cfg)
+    calibrator = ConformalRiskCalibrator(delta=risk_delta, initial_quantile=0.60)
+    budget_controller = BudgetController(budget_fraction=budget_fraction)
+    rollback = RollbackBuffer()
+    effective_budget_tokens: List[float] = []
+    effective_budget_ops: List[float] = []
 
     watchdog_min_cos = cfg.watchdog_min_cos
     watchdog_max_kl = cfg.watchdog_max_kl
 
     per_seq_latency_ms: List[float] = []
     final_consistency: List[float] = []
+    risk_threshold_history: List[float] = []
+    delta_violation_history: List[float] = []
     total_start = time.time()
+    sampler = GPUUtilSampler(interval_sec=0.5)
+    sampler.start()
 
     for prompt in prompts:
         state = engine.encode_prompt(prompt)
@@ -436,34 +631,42 @@ def run_rule_gate(
             if compute_mask is None or np.all(compute_mask):
                 mask_to_use = None
             else:
-                mask_to_use = compute_mask
+                mask_to_use = compute_mask.astype(bool)
 
             prev_hidden_snapshot = [h.copy() for h in prev_hidden]
             prev_logits_snapshot = prev_logits.copy()
 
+            rollback.save(state)
             out = engine.step(state, t, compute_mask=mask_to_use)
 
-            cos_now, dl2_now, kl_now, entropy_now, margin_now, step_frac = compute_token_observables(
+            obs = compute_token_observables(
                 out.hidden_by_layer,
                 prev_hidden_snapshot,
                 out.logits,
                 prev_logits_snapshot,
                 t,
                 num_steps,
+                aux=out.aux if isinstance(out.aux, dict) else None,
             )
+            risk_scores = compute_risk_score(obs.cosine_norm, obs.delta_l2_norm, obs.kl)
 
-            watchdog_trigger = np.any((cos_now < watchdog_min_cos) | (kl_now > watchdog_max_kl))
-            if watchdog_trigger:
+            watchdog_mask = (obs.cosine < watchdog_min_cos) | (obs.kl > watchdog_max_kl)
+            if np.any(watchdog_mask):
+                calibrator.register(risk_scores, unsafe_mask=watchdog_mask)
+                rollback.restore(state)
                 mask_to_use = None
                 out = engine.step(state, t, compute_mask=None)
-                cos_now, dl2_now, kl_now, entropy_now, margin_now, step_frac = compute_token_observables(
+                obs = compute_token_observables(
                     out.hidden_by_layer,
                     prev_hidden_snapshot,
                     out.logits,
                     prev_logits_snapshot,
                     t,
                     num_steps,
+                    aux=out.aux if isinstance(out.aux, dict) else None,
                 )
+                risk_scores = compute_risk_score(obs.cosine_norm, obs.delta_l2_norm, obs.kl)
+                watchdog_mask = np.zeros_like(risk_scores, dtype=bool)
 
             seq_len = out.logits.shape[0]
             frozen_tokens = 0 if mask_to_use is None else (seq_len - int(np.sum(mask_to_use)))
@@ -475,15 +678,24 @@ def run_rule_gate(
             baseline_ops += (num_layers_seen * seq_len)
             actual_ops += (num_layers_seen * (seq_len - frozen_tokens))
             skip_stats_rows.append(f"{t},{seq_len},{frozen_tokens},{frozen_ratio:.6f},{num_layers_seen},0")
+            freeze_ratios_by_step[t].append(frozen_ratio)
+
+            risk_threshold = calibrator.effective_threshold(risk_scores)
+            risk_threshold_history.append(risk_threshold)
+            if risk_scores.size > 0:
+                delta_violation_history.append(float(np.mean(risk_scores > risk_threshold)))
 
             gate.update(
-                feats_cos=cos_now,
-                feats_dl2=dl2_now,
-                feats_kl=kl_now,
-                entropy=entropy_now,
-                margin=margin_now,
+                feats_cos=obs.cosine,
+                feats_dl2=obs.delta_l2,
+                feats_kl=obs.kl,
+                entropy=obs.entropy,
+                margin=obs.margin,
+                risk_scores=risk_scores,
+                risk_threshold=risk_threshold,
                 num_tokens=out.logits.shape[0],
                 compute_mask=mask_to_use,
+                budget_controller=budget_controller,
             )
 
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
@@ -496,6 +708,8 @@ def run_rule_gate(
         # FLOPs-proxy savings (new): token×layer×step
         flops_savings = 1.0 - (actual_ops / max(1, baseline_ops))
         savings_ratios.append(float(flops_savings))
+        effective_budget_tokens.append(1.0 - token_savings)
+        effective_budget_ops.append(1.0 - flops_savings)
         aggregates.append({
             "mode": "rule_gate",
             "prompt_len": len(prompt),
@@ -528,8 +742,24 @@ def run_rule_gate(
     if len(savings_ratios) > 0:
         save_hist(np.array(savings_ratios), os.path.join(out_dirs["figures"], f"rule_gate_savings_hist_{timestamp}.png"), title="Token compute savings ratio")
 
+    try:
+        from src.viz.rich import render_rule_gate_suite
+
+        render_rule_gate_suite(
+            out_dirs["figures"],
+            timestamp,
+            savings_ratios,
+            freeze_ratios_by_step,
+            risk_threshold_history,
+            delta_violation_history,
+            per_seq_latency_ms,
+        )
+    except Exception:
+        pass
+
     total_time_s = max(1e-6, time.time() - total_start)
-    gpu = query_gpu_utilization() or {}
+    sampler.stop()
+    gpu = sampler.metrics or (query_gpu_utilization() or {})
     summary = {
         "mode": "rule_gate",
         "num_prompts": len(prompts),
@@ -539,7 +769,13 @@ def run_rule_gate(
         "latency_ms_p90": float(np.percentile(per_seq_latency_ms, 90) if per_seq_latency_ms else 0.0),
         "throughput_seq_per_s": float(len(prompts) / total_time_s),
         "skip_ratio_mean": float(np.mean(savings_ratios) if savings_ratios else 0.0),
-        "final_token_consistency_mean": float(np.mean(final_consistency) if final_consistency else -1.0),
+        "final_token_consistency_mean": float(np.mean(final_consistency)) if final_consistency else None,
+        "risk_threshold_mean": float(np.mean(risk_threshold_history)) if risk_threshold_history else None,
+        "delta_violation_mean": float(np.mean(delta_violation_history)) if delta_violation_history else None,
+        "budget_fraction": float(np.mean(effective_budget_ops)) if effective_budget_ops else None,
+        "budget_fraction_target": float(budget_fraction),
+        "budget_fraction_tokens": float(np.mean(effective_budget_tokens)) if effective_budget_tokens else None,
+        "risk_delta": float(risk_delta),
         **{f"gpu_{k}": v for k, v in gpu.items()},
     }
     with open(os.path.join(out_dirs["runs"], f"rule_gate_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
@@ -554,17 +790,27 @@ def run_learned_gate(
     gate: LearnedGate,
     watchdog_min_cos: float,
     watchdog_max_kl: float,
+    risk_delta: float,
+    budget_fraction: float,
     consistency_check: bool = False,
 ) -> None:
     from src.viz.plots import save_hist
 
     aggregates: List[Dict] = []
     savings_ratios: List[float] = []
+    effective_budget_tokens: List[float] = []
     prob_samples: List[float] = []
+    freeze_ratios_by_step: Dict[int, List[float]] = defaultdict(list)
 
     per_seq_latency_ms: List[float] = []
     final_consistency: List[float] = []
     total_start = time.time()
+    sampler = GPUUtilSampler(interval_sec=0.5)
+    sampler.start()
+    calibrator = ConformalRiskCalibrator(delta=risk_delta, initial_quantile=0.60)
+    budget_controller = BudgetController(budget_fraction=budget_fraction)
+    risk_threshold_history: List[float] = []
+    delta_violation_history: List[float] = []
 
     for prompt in prompts:
         state = engine.encode_prompt(prompt)
@@ -589,44 +835,75 @@ def run_learned_gate(
             if compute_mask is None or np.all(compute_mask):
                 mask_to_use = None
             else:
-                mask_to_use = compute_mask
+                mask_to_use = compute_mask.astype(bool)
 
             prev_hidden_snapshot = [h.copy() for h in prev_hidden]
             prev_logits_snapshot = prev_logits.copy()
 
             out = engine.step(state, t, compute_mask=mask_to_use)
 
-            cos_now, dl2_now, kl_now, entropy_now, margin_now, step_frac = compute_token_observables(
+            seq_len = out.logits.shape[0]
+            computed_tokens = seq_len if mask_to_use is None else int(np.sum(mask_to_use))
+            total_tokens_computed += computed_tokens
+            total_tokens_possible += seq_len
+            if seq_len > 0:
+                freeze_ratios_by_step[t].append(1.0 - (computed_tokens / float(seq_len)))
+
+            obs = compute_token_observables(
                 out.hidden_by_layer,
                 prev_hidden_snapshot,
                 out.logits,
                 prev_logits_snapshot,
                 t,
                 num_steps,
+                aux=out.aux if isinstance(out.aux, dict) else None,
             )
+            risk_scores = compute_risk_score(obs.cosine_norm, obs.delta_l2_norm, obs.kl)
 
-            watchdog_trigger = np.any((cos_now < watchdog_min_cos) | (kl_now > watchdog_max_kl))
-            if watchdog_trigger:
+            watchdog_mask = (obs.cosine < watchdog_min_cos) | (obs.kl > watchdog_max_kl)
+            if np.any(watchdog_mask):
+                calibrator.register(risk_scores, unsafe_mask=watchdog_mask)
                 mask_to_use = None
                 out = engine.step(state, t, compute_mask=None)
-                cos_now, dl2_now, kl_now, entropy_now, margin_now, step_frac = compute_token_observables(
+                obs = compute_token_observables(
                     out.hidden_by_layer,
                     prev_hidden_snapshot,
                     out.logits,
                     prev_logits_snapshot,
                     t,
                     num_steps,
+                    aux=out.aux if isinstance(out.aux, dict) else None,
                 )
+                risk_scores = compute_risk_score(obs.cosine_norm, obs.delta_l2_norm, obs.kl)
 
             computed_tokens = out.logits.shape[0] if mask_to_use is None else int(np.sum(mask_to_use))
             total_tokens_computed += computed_tokens
             total_tokens_possible += out.logits.shape[0]
 
-            features = np.stack([cos_now, dl2_now, kl_now, entropy_now, margin_now, step_frac], axis=-1).astype(np.float32)
+            # Use raw features to match training FEATURE_NAMES[:7]
+            features = np.stack(
+                [
+                    obs.cosine,
+                    obs.delta_l2,
+                    obs.kl,
+                    obs.entropy,
+                    obs.margin,
+                    obs.step_frac,
+                    obs.sigma,
+                ],
+                axis=-1,
+            ).astype(np.float32)
+            risk_threshold = calibrator.effective_threshold(risk_scores)
+            risk_threshold_history.append(risk_threshold)
+            if risk_scores.size > 0:
+                delta_violation_history.append(float(np.mean(risk_scores > risk_threshold)))
             gate_result = gate.update(
                 features=features,
                 num_tokens=out.logits.shape[0],
+                risk_threshold=risk_threshold,
+                feature_margin=obs.margin,
                 compute_mask=mask_to_use,
+                budget_controller=budget_controller,
             )
 
             if gate_result.probabilities is not None:
@@ -639,6 +916,7 @@ def run_learned_gate(
 
         savings = 1.0 - (total_tokens_computed / max(1, total_tokens_possible))
         savings_ratios.append(float(savings))
+        effective_budget_tokens.append(1.0 - savings)
         aggregates.append({"mode": "learned_gate", "prompt_len": len(prompt), "savings": float(savings)})
 
         if consistency_check:
@@ -660,8 +938,25 @@ def run_learned_gate(
     if prob_samples:
         save_hist(np.array(prob_samples), os.path.join(out_dirs["figures"], f"learned_gate_prob_hist_{timestamp}.png"), title="Learned gate freeze probability")
 
+    try:
+        from src.viz.rich import render_learned_gate_suite
+
+        render_learned_gate_suite(
+            out_dirs["figures"],
+            timestamp,
+            savings_ratios,
+            freeze_ratios_by_step,
+            risk_threshold_history,
+            delta_violation_history,
+            per_seq_latency_ms,
+            prob_samples,
+        )
+    except Exception:
+        pass
+
     total_time_s = max(1e-6, time.time() - total_start)
-    gpu = query_gpu_utilization() or {}
+    sampler.stop()
+    gpu = sampler.metrics or (query_gpu_utilization() or {})
     summary = {
         "mode": "learned_gate",
         "num_prompts": len(prompts),
@@ -671,16 +966,189 @@ def run_learned_gate(
         "latency_ms_p90": float(np.percentile(per_seq_latency_ms, 90) if per_seq_latency_ms else 0.0),
         "throughput_seq_per_s": float(len(prompts) / total_time_s),
         "skip_ratio_mean": float(np.mean(savings_ratios) if savings_ratios else 0.0),
-        "final_token_consistency_mean": float(np.mean(final_consistency) if final_consistency else -1.0),
+        "final_token_consistency_mean": float(np.mean(final_consistency)) if final_consistency else None,
+        "risk_threshold_mean": float(np.mean(risk_threshold_history)) if risk_threshold_history else None,
+        "delta_violation_mean": float(np.mean(delta_violation_history)) if delta_violation_history else None,
+        "budget_fraction": float(np.mean(effective_budget_tokens)) if effective_budget_tokens else None,
+        "budget_fraction_target": float(budget_fraction),
+        "risk_delta": float(risk_delta),
         **{f"gpu_{k}": v for k, v in gpu.items()},
     }
     with open(os.path.join(out_dirs["runs"], f"learned_gate_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
+
+def run_adaptive(
+    engine: BaseEngine,
+    prompts: List[str],
+    out_dirs: Dict[str, str],
+    num_steps: int,
+    scheduler_cfg: AdaptiveSchedulerConfig,
+    risk_delta: float,
+    skip_budget: float,
+) -> None:
+    scheduler = AdaptiveScheduler(scheduler_cfg)
+    calibrator = ConformalRiskCalibrator(delta=risk_delta)
+    per_seq_latency_ms: List[float] = []
+    skip_estimates: List[float] = []
+    lte_traces: List[List[float]] = []
+    risk_traces: List[List[float]] = []
+    stride_traces: List[List[int]] = []
+    lte_threshold_traces: List[List[float]] = []
+    total_start = time.time()
+
+    for prompt in prompts:
+        state = engine.encode_prompt(prompt)
+        prev_hidden: Optional[List[np.ndarray]] = None
+        prev_logits: Optional[np.ndarray] = None
+        seq_start = time.time()
+        effective_steps = 0.0
+        prompt_lte: List[float] = []
+        prompt_risk: List[float] = []
+        prompt_stride: List[int] = []
+        prompt_lte_thresholds: List[float] = []
+        lte_history: List[float] = []
+
+        for t in range(num_steps):
+            out = engine.step(state, t, compute_mask=None)
+            if prev_hidden is None or prev_logits is None:
+                prev_hidden = [h.copy() for h in out.hidden_by_layer]
+                prev_logits = out.logits.copy()
+                effective_steps += 1.0
+                prompt_stride.append(scheduler.stride)
+                continue
+
+            obs = compute_token_observables(
+                out.hidden_by_layer,
+                prev_hidden,
+                out.logits,
+                prev_logits,
+                t,
+                num_steps,
+                aux=out.aux if isinstance(out.aux, dict) else None,
+            )
+            risk_scores = compute_risk_score(obs.cosine_norm, obs.delta_l2_norm, obs.kl)
+            calibrator.register(risk_scores, unsafe_mask=None)
+            risk_threshold = calibrator.effective_threshold(risk_scores)
+            lte_raw = float(np.mean(np.abs(obs.delta_l2)))
+            lte_norm = float(np.mean(np.abs(obs.delta_l2_norm)))
+            lte_value = lte_norm if scheduler_cfg.use_normalized_lte else lte_raw
+            risk_metric = float(np.quantile(risk_scores.astype(np.float64), 0.90, method="higher")) if risk_scores.size > 0 else 0.0
+            lte_history.append(lte_value)
+            if scheduler_cfg.use_normalized_lte or scheduler_cfg.lte_eps > 1.0:
+                lte_threshold = float(scheduler_cfg.lte_eps)
+            else:
+                quantile = float(np.clip(scheduler_cfg.lte_eps, 0.0, 1.0))
+                lte_threshold = float(np.quantile(np.asarray(lte_history, dtype=np.float32), quantile))
+            scheduler.observe(lte_value, lte_threshold, risk_metric, risk_threshold)
+            prompt_lte.append(lte_value)
+            prompt_risk.append(risk_metric)
+            prompt_stride.append(scheduler.stride)
+            prompt_lte_thresholds.append(lte_threshold)
+            stride = scheduler.stride
+            effective_steps += 1.0 / max(1, stride)
+
+            prev_hidden = [h.copy() for h in out.hidden_by_layer]
+            prev_logits = out.logits.copy()
+
+        per_seq_latency_ms.append((time.time() - seq_start) * 1000.0)
+        nominal_steps = float(num_steps)
+        skip_estimates.append(max(0.0, 1.0 - (effective_steps / nominal_steps)))
+        scheduler.reset()
+        lte_traces.append(prompt_lte)
+        risk_traces.append(prompt_risk)
+        stride_traces.append(prompt_stride)
+        lte_threshold_traces.append(prompt_lte_thresholds)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    # Simple visuals: histogram of per-sequence estimated skip ratios
+    try:
+        from src.viz.plots import save_hist
+        if skip_estimates:
+            save_hist(np.array(skip_estimates), os.path.join(out_dirs["figures"], f"adaptive_skip_hist_{timestamp}.png"), title="Adaptive estimated skip ratio per sequence")
+    except Exception:
+        pass
+    try:
+        from src.viz.rich import render_adaptive_suite
+        render_adaptive_suite(
+            out_dirs["figures"],
+            timestamp,
+            skip_estimates,
+            lte_traces,
+            risk_traces,
+            stride_traces,
+            lte_threshold_traces,
+            scheduler_cfg,
+        )
+    except Exception:
+        pass
+    summary = {
+        "mode": "adaptive",
+        "num_prompts": len(prompts),
+        "num_steps": num_steps,
+        "latency_ms_mean": float(np.mean(per_seq_latency_ms) if per_seq_latency_ms else 0.0),
+        "latency_ms_p50": float(np.percentile(per_seq_latency_ms, 50) if per_seq_latency_ms else 0.0),
+        "latency_ms_p90": float(np.percentile(per_seq_latency_ms, 90) if per_seq_latency_ms else 0.0),
+        "skip_ratio_est_mean": float(np.mean(skip_estimates) if skip_estimates else 0.0),
+        "skip_budget": float(skip_budget),
+        "risk_delta": float(risk_delta),
+        "lte_eps": float(scheduler_cfg.lte_eps),
+        "max_stride": int(scheduler_cfg.max_stride),
+    }
+    with open(os.path.join(out_dirs["runs"], f"adaptive_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+
+def run_baselines(
+    out_dirs: Dict[str, str],
+    num_steps: int,
+    skip_ratios: Optional[List[float]] = None,
+) -> None:
+    baselines: List[Dict[str, float]] = []
+
+    for t0 in (4, 6, 8):
+        for stride in (2, 3):
+            if t0 >= num_steps:
+                skip = 0.0
+            else:
+                active_steps = max(0, num_steps - t0)
+                skip = (active_steps / max(1, num_steps)) * (1.0 - (1.0 / float(stride)))
+            baselines.append({
+                "name": f"fixed_stride_t{t0}_s{stride}",
+                "skip_ratio_est": skip,
+            })
+
+    # Index-only policy: stride increases with step index
+    index_skip = 0.0
+    for idx in range(1, num_steps + 1):
+        stride = 1 + (idx // 4)
+        index_skip += 1.0 - (1.0 / float(stride))
+    baselines.append({"name": "index_only", "skip_ratio_est": index_skip / max(1, num_steps)})
+
+    # Uniform layer throttling approximated as constant fraction savings
+    for M in (2, 3, 4):
+        skip = 1.0 - (1.0 / float(M))
+        baselines.append({"name": f"layer_throttle_M{M}", "skip_ratio_est": skip})
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    with open(os.path.join(out_dirs["runs"], f"baselines_{timestamp}.json"), "w", encoding="utf-8") as f:
+        json.dump({"num_steps": num_steps, "baselines": baselines}, f, indent=2)
+    # Also write a quick histogram for visualization
+    try:
+        from src.viz.plots import save_hist
+        save_hist(
+            np.array([b["skip_ratio_est"] for b in baselines], dtype=np.float32),
+            os.path.join(out_dirs["figures"], f"baselines_skip_hist_{timestamp}.png"),
+            title="Baseline estimated skip ratios",
+        )
+    except Exception:
+        pass
+
+
 def main() -> None:
     args = parse_args()
     cfg = load_yaml(args.config)
-    default_paths = load_default_paths(cfg.get("paths_config"))
+    default_paths = load_default_paths(coalesce(args.paths_cfg, cfg.get("paths_config")))
 
     repo_root = Path(__file__).resolve().parents[1]
     mode = args.mode
@@ -719,6 +1187,8 @@ def main() -> None:
     watchdog_cfg = cfg.get("watchdog", {})
     watchdog_min_cos = float(coalesce(args.watchdog_min_cos, watchdog_cfg.get("min_cos"), 0.90))
     watchdog_max_kl = float(coalesce(args.watchdog_max_kl, watchdog_cfg.get("max_kl"), 0.02))
+    risk_delta = float(coalesce(args.risk_delta, cfg.get("risk_delta"), 0.01))
+    budget_fraction = float(coalesce(args.budget_fraction, cfg.get("budget_fraction"), 1.0))
 
     outputs_root = str(outputs_root)
     run_dir = ensure_output_dirs(outputs_root, phase=phase, mode=mode, engine=engine_name, exp_name=exp_name)
@@ -817,6 +1287,7 @@ def main() -> None:
                 num_steps,
                 dump_features_dir=dump_features_dir,
                 label_thresholds=label_thresholds,
+                oracle_eval=bool(args.oracle_eval or cfg.get("oracle_eval", False)),
             )
             if args.consistency_full_compute and engine_name == "d2f":
                 # Full-compute twice to verify stability; write difference report
@@ -858,6 +1329,8 @@ def main() -> None:
                 out_dirs,
                 num_steps,
                 rule_cfg,
+                risk_delta=risk_delta,
+                budget_fraction=budget_fraction,
                 consistency_check=args.consistency_check,
             )
         elif mode == "learned_gate":
@@ -882,8 +1355,38 @@ def main() -> None:
                 gate,
                 watchdog_min_cos=watchdog_min_cos,
                 watchdog_max_kl=watchdog_max_kl,
+                risk_delta=risk_delta,
+                budget_fraction=budget_fraction,
                 consistency_check=args.consistency_check,
             )
+        elif mode == "adaptive":
+            scheduler_cfg = AdaptiveSchedulerConfig(
+                lte_eps=float(args.lte_eps),
+                min_consecutive=int(args.lte_min_consec),
+                max_stride=int(args.max_stride),
+                base_stride=1,
+            )
+            run_adaptive(
+                engine,
+                prompts,
+                out_dirs,
+                num_steps,
+                scheduler_cfg=scheduler_cfg,
+                risk_delta=risk_delta,
+                skip_budget=float(args.adaptive_budget),
+            )
+        elif mode == "oracle":
+            feature_path = run_teacher(
+                engine,
+                prompts,
+                out_dirs,
+                num_steps,
+                dump_features_dir=dump_features_dir,
+                label_thresholds=label_thresholds,
+                oracle_eval=True,
+            )
+        elif mode == "baselines":
+            run_baselines(out_dirs, num_steps)
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 
