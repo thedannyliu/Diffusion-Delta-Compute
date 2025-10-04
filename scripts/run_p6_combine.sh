@@ -3,7 +3,18 @@ set -euo pipefail
 
 PROJECT_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 PYTHON=${PYTHON:-python}
-REPORT_ROOT=${REPORT_ROOT:-$PROJECT_ROOT/reports}
+
+# Choose a writable REPORT_ROOT
+DEFAULT_REPORT_ROOT="$PROJECT_ROOT/reports"
+REQUESTED_REPORT_ROOT=${REPORT_ROOT:-$DEFAULT_REPORT_ROOT}
+if ! mkdir -p "$REQUESTED_REPORT_ROOT" 2>/dev/null || [[ ! -w "$REQUESTED_REPORT_ROOT" ]]; then
+  echo "[warn] REPORT_ROOT=$REQUESTED_REPORT_ROOT not writable. Falling back to $DEFAULT_REPORT_ROOT" >&2
+  REPORT_ROOT="$DEFAULT_REPORT_ROOT"
+  mkdir -p "$REPORT_ROOT"
+else
+  REPORT_ROOT="$REQUESTED_REPORT_ROOT"
+fi
+
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUT_DIR=${OUT_DIR:-$REPORT_ROOT/P6/combine/$TIMESTAMP}
 RUNS_DIR="$OUT_DIR/runs"

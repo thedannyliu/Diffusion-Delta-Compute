@@ -30,13 +30,22 @@ fi
 export PYTHON="${PYTHON:-$(command -v python)}"
 mkdir -p logs
 
-REPORT_ROOT=${REPORT_ROOT:-$PROJECT_ROOT/reports}
-OUT_DIR=${OUT_DIR:-}
-
-if [[ -z "$OUT_DIR" ]]; then
-  export OUT_DIR="$REPORT_ROOT/P6/combine/$(date +%Y%m%d_%H%M%S)"
+DEFAULT_REPORT_ROOT="$PROJECT_ROOT/reports"
+# Respect pre-set REPORT_ROOT only if it's writable; otherwise fall back.
+REQUESTED_REPORT_ROOT=${REPORT_ROOT:-$DEFAULT_REPORT_ROOT}
+if ! mkdir -p "$REQUESTED_REPORT_ROOT" 2>/dev/null || [[ ! -w "$REQUESTED_REPORT_ROOT" ]]; then
+  echo "[warn] REPORT_ROOT=$REQUESTED_REPORT_ROOT not writable. Falling back to $DEFAULT_REPORT_ROOT" >&2
+  REPORT_ROOT="$DEFAULT_REPORT_ROOT"
+  mkdir -p "$REPORT_ROOT" || { echo "[ERROR] Failed to create fallback REPORT_ROOT at $REPORT_ROOT" >&2; exit 1; }
+else
+  REPORT_ROOT="$REQUESTED_REPORT_ROOT"
 fi
-mkdir -p "$OUT_DIR"
+
+OUT_DIR=${OUT_DIR:-}
+if [[ -z "$OUT_DIR" ]]; then
+  OUT_DIR="$REPORT_ROOT/P6/combine/$(date +%Y%m%d_%H%M%S)"
+fi
+mkdir -p "$OUT_DIR" || { echo "[ERROR] Failed to create OUT_DIR at $OUT_DIR" >&2; exit 1; }
 
 echo "[sbatch] P6 combine report using REPORT_ROOT=${REPORT_ROOT} -> OUT_DIR=${OUT_DIR}"
 EXPORT_VARS=ALL,REPORT_ROOT=${REPORT_ROOT},OUT_DIR=${OUT_DIR}
