@@ -20,6 +20,8 @@ class D2FDreamEngine(BaseEngine):
 
     def __init__(self, model_name: str = "d2f-small", device: str = "cuda", model_path: Optional[str] = None, lora_path: Optional[str] = None, use_lora: bool = False, num_steps: int = 12, max_seq_len: int = 128) -> None:
         self._device = device if torch.cuda.is_available() and device.startswith("cuda") else "cpu"
+        if self._device == "cpu":
+            print("[warn] CUDA not available; D2F engine is running on CPU. GPU utilization will be ~0.", flush=True)
         self._model_name = model_name
         self._model_path = model_path
         self._lora_path = lora_path
@@ -151,5 +153,4 @@ class D2FDreamEngine(BaseEngine):
 
     def num_steps(self) -> int:
         return self._num_steps
-
 

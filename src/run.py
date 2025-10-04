@@ -1,11 +1,12 @@
 import argparse
 import json
 import os
+import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -32,6 +33,14 @@ from src.gating.adaptive import AdaptiveScheduler, AdaptiveSchedulerConfig
 from src.gating.rollback import RollbackBuffer
 from src.eval.tasks import load_wikitext2, load_lambada_openai, load_gsm8k_tiny
 from src.utils.profile import query_gpu_utilization, GPUUtilSampler
+from src.utils.quantiles import (
+    DEFAULT_QUANTILES,
+    StepQuantileTable,
+    apply_ema,
+    clip_sequence,
+    compute_step_metric_quantiles,
+    dump_step_quantiles,
+)
 from src.utils.config import load_yaml, ensure_output_dirs, save_manifest
 
 try:  # Optional dependency; scripts can run without W&B
@@ -85,6 +94,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--watchdog_min_cos", type=float, default=None)
     parser.add_argument("--watchdog_max_kl", type=float, default=None)
     parser.add_argument("--layer_recompute_M", type=int, default=None)
+    parser.add_argument("--gamma_margin", type=float, default=None, help="Margin threshold override for gating decisions")
+    parser.add_argument("--quantiles_path", type=str, default=None, help="Path to teacher stepwise quantiles JSON")
+    parser.add_argument("--one_minus_cos_quantile", type=float, default=None, help="Quantile level (0-1) used to derive per-step cosine thresholds")
+    parser.add_argument("--delta_l2_quantile", type=float, default=None, help="Quantile level (0-1) used to derive per-step ΔL2 thresholds")
+    parser.add_argument("--kl_quantile", type=float, default=None, help="Quantile level (0-1) used to derive per-step KL guard thresholds")
+    parser.add_argument("--stepwise_ema", type=float, default=None, help="EMA smoothing factor (0-1, high=more smoothing) for stepwise thresholds")
+    parser.add_argument("--stepwise_clip", type=str, default=None, help="Comma-separated min,max bounds applied to raw stepwise thresholds")
     parser.add_argument("--consistency_full_compute", action="store_true", help="Run full-compute baseline and compare outputs; write difference report")
     parser.add_argument("--risk_delta", type=float, default=0.01, help="Target conformal δ bound")
     parser.add_argument("--budget_fraction", type=float, default=1.0, help="Per-step compute budget as fraction of Teacher FLOPs")
@@ -170,6 +186,67 @@ FEATURE_NAMES = (
 )
 
 
+_SLUG_RE = re.compile(r"[^a-zA-Z0-9_-]+")
+
+
+def slugify(value: Optional[str], fallback: str = "run") -> str:
+    if not value:
+        return fallback
+    candidate = str(value).strip().replace(" ", "_")
+    candidate = _SLUG_RE.sub("-", candidate)
+    candidate = candidate.strip("-_")
+    return candidate or fallback
+
+
+def parse_clip_config(value: Optional[object]) -> Tuple[Optional[float], Optional[float]]:
+    if value is None:
+        return (None, None)
+    if isinstance(value, str):
+        parts = [part for part in value.split(",") if part]
+    elif isinstance(value, (list, tuple)):
+        parts = [str(part) for part in value]
+    else:
+        raise ValueError("stepwise_clip must be a comma-separated string or length-2 sequence")
+    if not parts:
+        return (None, None)
+    if len(parts) == 1:
+        lo = float(parts[0])
+        return (lo, None)
+    lo = float(parts[0]) if parts[0] else None
+    hi = float(parts[1]) if parts[1] else None
+    return (lo, hi)
+
+
+@dataclass
+class TeacherArtifacts:
+    features_path: Optional[str] = None
+    quantiles_path: Optional[str] = None
+
+
+@dataclass
+class StepwiseThresholds:
+    cosine_tau: List[float]
+    delta_l2_rho: List[float]
+    gamma_margin: Optional[List[float]] = None
+    source_path: Optional[str] = None
+
+    def cosine_for_step(self, step: int) -> Optional[float]:
+        if 0 <= step < len(self.cosine_tau):
+            return float(self.cosine_tau[step])
+        return None
+
+    def delta_for_step(self, step: int) -> Optional[float]:
+        if 0 <= step < len(self.delta_l2_rho):
+            return float(self.delta_l2_rho[step])
+        return None
+
+    def margin_for_step(self, step: int) -> Optional[float]:
+        if self.gamma_margin is None:
+            return None
+        if 0 <= step < len(self.gamma_margin):
+            return float(self.gamma_margin[step])
+        return None
+
 @dataclass
 class TokenObservables:
     cosine: np.ndarray
@@ -243,7 +320,11 @@ def run_teacher(
     dump_features_dir: Optional[str] = None,
     label_thresholds: Optional[Dict[str, float]] = None,
     oracle_eval: bool = False,
-) -> Optional[str]:
+    *,
+    task_name: Optional[str] = None,
+    exp_name: Optional[str] = None,
+    quantile_levels: Sequence[float] = DEFAULT_QUANTILES,
+) -> TeacherArtifacts:
     from src.viz.plots import save_heatmap, save_hist
 
     aggregates: List[Dict] = []
@@ -275,6 +356,14 @@ def run_teacher(
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     layer_step_mse: Dict[Tuple[int, int], List[float]] = defaultdict(list)
 
+    metric_samples = {
+        "one_minus_cos": defaultdict(list),
+        "delta_l2_norm": defaultdict(list),
+        "kl": defaultdict(list),
+    }
+    step_token_counts: Dict[int, int] = defaultdict(int)
+    features_path: Optional[str] = None
+
     for prompt_idx, prompt in enumerate(prompts):
         state = engine.encode_prompt(prompt)
         prev_hidden: Optional[List[np.ndarray]] = None
@@ -295,6 +384,11 @@ def run_teacher(
         seq_start = time.time()
         for t in range(num_steps):
             out = engine.step(state, t)
+            # Immediate GPU sample after a GPU-heavy op to avoid missing short spikes
+            try:
+                sampler.sample_once()
+            except Exception:
+                pass
             if prev_hidden is not None and prev_logits is not None:
                 # Build valid mask (exclude padding and special tokens)
                 valid_mask: Optional[np.ndarray] = None
@@ -335,6 +429,10 @@ def run_teacher(
                 cos_hist_samples.extend(cos.flatten().tolist())
                 dl2_hist_samples.extend(dl2.flatten().tolist())
                 dl2_norm_hist_samples.extend(dl2_norm.flatten().tolist())
+                metric_samples["one_minus_cos"][t].append(1.0 - cos)
+                metric_samples["delta_l2_norm"][t].append(dl2_norm)
+                metric_samples["kl"][t].append(kl)
+                step_token_counts[t] += int(cos.shape[0])
                 if stability_counter is None or stability_counter.shape[0] != labels.shape[0]:
                     stability_counter = np.zeros_like(labels, dtype=np.int32)
                     stability_max = np.zeros_like(labels, dtype=np.int32)
@@ -503,23 +601,6 @@ def run_teacher(
     if len(dl2_norm_hist_samples) > 0:
         save_hist(np.array(dl2_norm_hist_samples), os.path.join(out_dirs["figures"], f"teacher_dl2norm_hist_{timestamp}.png"), title="ΔL2 normalized histogram")
 
-    total_time_s = max(1e-6, time.time() - total_start)
-    sampler.stop()
-    gpu = sampler.metrics or (query_gpu_utilization() or {})
-    summary = {
-        "mode": "teacher",
-        "num_prompts": len(prompts),
-        "num_steps": num_steps,
-        "latency_ms_mean": float(np.mean(per_seq_latency_ms) if per_seq_latency_ms else 0.0),
-        "latency_ms_p50": float(np.percentile(per_seq_latency_ms, 50) if per_seq_latency_ms else 0.0),
-        "latency_ms_p90": float(np.percentile(per_seq_latency_ms, 90) if per_seq_latency_ms else 0.0),
-        "throughput_seq_per_s": float(len(prompts) / total_time_s),
-        "oracle_skip_ratio_mean": float(np.mean(oracle_ratios) if oracle_ratios else -1.0),
-        **{f"gpu_{k}": v for k, v in gpu.items()},
-    }
-    with open(os.path.join(out_dirs["runs"], f"teacher_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
     try:
         from src.viz.rich import render_teacher_suite
 
@@ -543,6 +624,10 @@ def run_teacher(
     except Exception:
         pass
 
+    total_time_s = max(1e-6, time.time() - total_start)
+    sampler.stop()
+    gpu = sampler.metrics or (query_gpu_utilization() or {})
+
     if dump_features_dir and feature_blocks:
         os.makedirs(dump_features_dir, exist_ok=True)
         features = np.concatenate(feature_blocks, axis=0)
@@ -557,9 +642,55 @@ def run_teacher(
             feature_names=np.array(FEATURE_NAMES),
             label_thresholds=np.array([cos_tau, dl2_rho, kl_max], dtype=np.float32),
         )
-        return out_path
+        features_path = out_path
 
-    return None
+    quantiles_by_metric: Dict[str, Dict[int, Dict[str, float]]] = {}
+    for metric_name, samples in metric_samples.items():
+        quantiles_by_metric[metric_name] = compute_step_metric_quantiles(samples, quantile_levels)
+
+    token_counts = {str(step): int(count) for step, count in step_token_counts.items()}
+    dataset_slug = slugify(task_name, "dataset")
+    exp_slug = slugify(exp_name, dataset_slug)
+    quantile_filename = "_".join([
+        "teacher_quantiles",
+        dataset_slug,
+        exp_slug,
+        timestamp,
+    ]) + ".json"
+    quantiles_path = os.path.join(out_dirs["runs"], quantile_filename)
+    dump_step_quantiles(
+        quantiles_path,
+        quantiles_by_metric,
+        metadata={
+            "task": task_name,
+            "exp_name": exp_name,
+            "num_steps": num_steps,
+            "quantiles": list(float(q) for q in quantile_levels),
+            "token_counts": token_counts,
+            "timestamp": timestamp,
+        },
+    )
+
+    summary = {
+        "mode": "teacher",
+        "num_prompts": len(prompts),
+        "num_steps": num_steps,
+        "latency_ms_mean": float(np.mean(per_seq_latency_ms) if per_seq_latency_ms else 0.0),
+        "latency_ms_p50": float(np.percentile(per_seq_latency_ms, 50) if per_seq_latency_ms else 0.0),
+        "latency_ms_p90": float(np.percentile(per_seq_latency_ms, 90) if per_seq_latency_ms else 0.0),
+        "throughput_seq_per_s": float(len(prompts) / total_time_s),
+        "oracle_skip_ratio_mean": float(np.mean(oracle_ratios) if oracle_ratios else -1.0),
+        "quantiles_path": quantiles_path,
+        "features_path": features_path,
+        "task": task_name,
+        "exp_name": exp_name,
+        **{f"gpu_{k}": v for k, v in gpu.items()},
+    }
+    summary_path = os.path.join(out_dirs["runs"], f"teacher_summary_{timestamp}.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    return TeacherArtifacts(features_path=features_path, quantiles_path=quantiles_path)
 
 
 def run_rule_gate(
@@ -571,6 +702,7 @@ def run_rule_gate(
     risk_delta: float,
     budget_fraction: float,
     consistency_check: bool = False,
+    stepwise_thresholds: Optional[StepwiseThresholds] = None,
 ) -> None:
     from src.viz.plots import save_hist
 
@@ -592,6 +724,7 @@ def run_rule_gate(
     final_consistency: List[float] = []
     risk_threshold_history: List[float] = []
     delta_violation_history: List[float] = []
+    applied_thresholds: Dict[int, Dict[str, float]] = {}
     total_start = time.time()
     sampler = GPUUtilSampler(interval_sec=0.5)
     sampler.start()
@@ -638,6 +771,10 @@ def run_rule_gate(
 
             rollback.save(state)
             out = engine.step(state, t, compute_mask=mask_to_use)
+            try:
+                sampler.sample_once()
+            except Exception:
+                pass
 
             obs = compute_token_observables(
                 out.hidden_by_layer,
@@ -656,6 +793,10 @@ def run_rule_gate(
                 rollback.restore(state)
                 mask_to_use = None
                 out = engine.step(state, t, compute_mask=None)
+                try:
+                    sampler.sample_once()
+                except Exception:
+                    pass
                 obs = compute_token_observables(
                     out.hidden_by_layer,
                     prev_hidden_snapshot,
@@ -684,6 +825,15 @@ def run_rule_gate(
             risk_threshold_history.append(risk_threshold)
             if risk_scores.size > 0:
                 delta_violation_history.append(float(np.mean(risk_scores > risk_threshold)))
+            cosine_override = stepwise_thresholds.cosine_for_step(t) if stepwise_thresholds else None
+            delta_override = stepwise_thresholds.delta_for_step(t) if stepwise_thresholds else None
+            margin_override = stepwise_thresholds.margin_for_step(t) if stepwise_thresholds else None
+            if stepwise_thresholds is not None:
+                applied_thresholds[t] = {
+                    "cosine_tau": float(cosine_override if cosine_override is not None else cfg.cosine_tau),
+                    "delta_l2_rho": float(delta_override if delta_override is not None else cfg.delta_l2_rho),
+                    "gamma_margin": float(margin_override if margin_override is not None else cfg.gamma_margin),
+                }
 
             gate.update(
                 feats_cos=obs.cosine,
@@ -696,6 +846,9 @@ def run_rule_gate(
                 num_tokens=out.logits.shape[0],
                 compute_mask=mask_to_use,
                 budget_controller=budget_controller,
+                cosine_tau_override=cosine_override,
+                delta_l2_override=delta_override,
+                gamma_margin_override=margin_override,
             )
 
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
@@ -757,6 +910,24 @@ def run_rule_gate(
     except Exception:
         pass
 
+    thresholds_manifest_path: Optional[str] = None
+    if stepwise_thresholds is not None:
+        thresholds_manifest_path = os.path.join(
+            out_dirs["runs"], f"rule_gate_stepwise_thresholds_{timestamp}.json"
+        )
+        with open(thresholds_manifest_path, "w", encoding="utf-8") as fp:
+            json.dump(
+                {
+                    "source": stepwise_thresholds.source_path,
+                    "applied": {str(k): v for k, v in sorted(applied_thresholds.items())},
+                    "cosine_tau": [float(x) for x in stepwise_thresholds.cosine_tau],
+                    "delta_l2_rho": [float(x) for x in stepwise_thresholds.delta_l2_rho],
+                    "gamma_margin": None if stepwise_thresholds.gamma_margin is None else [float(x) for x in stepwise_thresholds.gamma_margin],
+                },
+                fp,
+                indent=2,
+            )
+
     total_time_s = max(1e-6, time.time() - total_start)
     sampler.stop()
     gpu = sampler.metrics or (query_gpu_utilization() or {})
@@ -776,6 +947,8 @@ def run_rule_gate(
         "budget_fraction_target": float(budget_fraction),
         "budget_fraction_tokens": float(np.mean(effective_budget_tokens)) if effective_budget_tokens else None,
         "risk_delta": float(risk_delta),
+        "stepwise_thresholds": thresholds_manifest_path,
+        "stepwise_thresholds_source": stepwise_thresholds.source_path if stepwise_thresholds is not None else None,
         **{f"gpu_{k}": v for k, v in gpu.items()},
     }
     with open(os.path.join(out_dirs["runs"], f"rule_gate_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
@@ -1184,11 +1357,26 @@ def main() -> None:
     consecutive_m = int(coalesce(args.m, cfg.get("m"), 2))
     freeze_K = int(coalesce(args.freeze_K, cfg.get("freeze_K"), 2))
     layer_recompute_M = int(coalesce(args.layer_recompute_M, cfg.get("layer_recompute_M"), 2))
+    stepwise_cfg = cfg.get("stepwise_thresholds", {})
+    gamma_margin = float(coalesce(args.gamma_margin, cfg.get("gamma_margin"), stepwise_cfg.get("margin_gamma"), 0.08))
     watchdog_cfg = cfg.get("watchdog", {})
     watchdog_min_cos = float(coalesce(args.watchdog_min_cos, watchdog_cfg.get("min_cos"), 0.90))
     watchdog_max_kl = float(coalesce(args.watchdog_max_kl, watchdog_cfg.get("max_kl"), 0.02))
     risk_delta = float(coalesce(args.risk_delta, cfg.get("risk_delta"), 0.01))
     budget_fraction = float(coalesce(args.budget_fraction, cfg.get("budget_fraction"), 1.0))
+    quantiles_path_raw = coalesce(args.quantiles_path, cfg.get("quantiles_path"), stepwise_cfg.get("quantiles_path"))
+    cos_quantile_level_raw = coalesce(args.one_minus_cos_quantile, cfg.get("one_minus_cos_quantile"), stepwise_cfg.get("one_minus_cos_q"))
+    delta_quantile_level_raw = coalesce(args.delta_l2_quantile, cfg.get("delta_l2_quantile"), stepwise_cfg.get("dl2_norm_q"))
+    kl_quantile_level_raw = coalesce(args.kl_quantile, cfg.get("kl_quantile"), stepwise_cfg.get("kl_q"))
+    stepwise_ema_raw = coalesce(args.stepwise_ema, cfg.get("stepwise_ema"), stepwise_cfg.get("ema"))
+    clip_min, clip_max = parse_clip_config(coalesce(args.stepwise_clip, cfg.get("stepwise_clip"), stepwise_cfg.get("clip_quantiles")))
+    stepwise_ema = float(stepwise_ema_raw) if stepwise_ema_raw is not None else None
+    cos_quantile_level = float(cos_quantile_level_raw) if cos_quantile_level_raw is not None else None
+    delta_quantile_level = float(delta_quantile_level_raw) if delta_quantile_level_raw is not None else None
+    kl_quantile_level = float(kl_quantile_level_raw) if kl_quantile_level_raw is not None else None
+    quantiles_path = None
+    if quantiles_path_raw:
+        quantiles_path = quantiles_path_raw if os.path.isabs(quantiles_path_raw) else os.path.abspath(os.path.join(repo_root, quantiles_path_raw))
 
     outputs_root = str(outputs_root)
     run_dir = ensure_output_dirs(outputs_root, phase=phase, mode=mode, engine=engine_name, exp_name=exp_name)
@@ -1216,8 +1404,18 @@ def main() -> None:
             "m": consecutive_m,
             "freeze_K": freeze_K,
             "layer_recompute_M": layer_recompute_M,
+            "gamma_margin": gamma_margin,
             "watchdog_min_cos": watchdog_min_cos,
             "watchdog_max_kl": watchdog_max_kl,
+        },
+        "stepwise_thresholds": {
+            "quantiles_path": quantiles_path,
+            "one_minus_cos_quantile": cos_quantile_level,
+            "delta_l2_quantile": delta_quantile_level,
+            "kl_quantile": kl_quantile_level,
+            "ema": stepwise_ema,
+            "clip_min": clip_min,
+            "clip_max": clip_max,
         },
     }
     save_manifest(run_dir, {
@@ -1277,10 +1475,10 @@ def main() -> None:
     prompts = load_prompts(num_prompts, task, data_root)
     out_dirs = {"figures": os.path.join(run_dir, "figures"), "runs": os.path.join(run_dir, "runs")}
 
-    feature_path: Optional[str] = None
+    teacher_artifacts: Optional[TeacherArtifacts] = None
     with Timer(f"run-{mode}"):
         if mode == "teacher":
-            feature_path = run_teacher(
+            teacher_artifacts = run_teacher(
                 engine,
                 prompts,
                 out_dirs,
@@ -1288,6 +1486,8 @@ def main() -> None:
                 dump_features_dir=dump_features_dir,
                 label_thresholds=label_thresholds,
                 oracle_eval=bool(args.oracle_eval or cfg.get("oracle_eval", False)),
+                task_name=task,
+                exp_name=exp_name,
             )
             if args.consistency_full_compute and engine_name == "d2f":
                 # Full-compute twice to verify stability; write difference report
@@ -1314,6 +1514,41 @@ def main() -> None:
                             prev1_z = o1.logits.copy()
                             prev2_z = o2.logits.copy()
         elif mode == "rule_gate":
+            stepwise_thresholds_obj: Optional[StepwiseThresholds] = None
+            if quantiles_path:
+                if not os.path.exists(quantiles_path):
+                    raise FileNotFoundError(f"Quantiles file not found: {quantiles_path}")
+                if cos_quantile_level is None or delta_quantile_level is None:
+                    raise ValueError("Stepwise thresholds require one_minus_cos_quantile and delta_l2_quantile")
+                table = StepQuantileTable.load(quantiles_path)
+                available_steps = table.num_steps if table.num_steps is not None else num_steps
+                step_count = min(num_steps, int(available_steps))
+                raw_one_minus_cos = [table.value("one_minus_cos", step, cos_quantile_level) for step in range(step_count)]
+                raw_delta = [table.value("delta_l2_norm", step, delta_quantile_level) for step in range(step_count)]
+                one_minus_cos_vals = clip_sequence(raw_one_minus_cos, clip_min, clip_max)
+                delta_vals = clip_sequence(raw_delta, clip_min, clip_max)
+                if stepwise_ema is not None:
+                    one_minus_cos_vals = apply_ema(one_minus_cos_vals, stepwise_ema)
+                    delta_vals = apply_ema(delta_vals, stepwise_ema)
+                cosine_tau_steps = [float(np.clip(1.0 - val, -1.0, 1.0)) for val in one_minus_cos_vals]
+                delta_l2_steps = [float(max(val, 0.0)) for val in delta_vals]
+                gamma_steps = [float(gamma_margin)] * step_count
+                stepwise_thresholds_obj = StepwiseThresholds(
+                    cosine_tau=cosine_tau_steps,
+                    delta_l2_rho=delta_l2_steps,
+                    gamma_margin=gamma_steps,
+                    source_path=quantiles_path,
+                )
+                if kl_quantile_level is not None:
+                    kl_values = [table.value("kl", step, kl_quantile_level) for step in range(step_count)]
+                    kl_values = clip_sequence(kl_values, clip_min, clip_max)
+                    if stepwise_ema is not None:
+                        kl_values = apply_ema(kl_values, stepwise_ema)
+                    if kl_values:
+                        watchdog_max_kl = max(float(max(kl_values)), watchdog_max_kl)
+                        resolved_manifest["rule_gate"]["watchdog_max_kl"] = watchdog_max_kl
+                print(f"[rule_gate] Loaded stepwise thresholds from {quantiles_path} (steps={step_count})")
+
             rule_cfg = RuleGateConfig(
                 cosine_tau=tau,
                 delta_l2_rho=rho,
@@ -1322,6 +1557,7 @@ def main() -> None:
                 watchdog_min_cos=watchdog_min_cos,
                 watchdog_max_kl=watchdog_max_kl,
                 layer_recompute_M=layer_recompute_M,
+                gamma_margin=gamma_margin,
             )
             run_rule_gate(
                 engine,
@@ -1332,6 +1568,7 @@ def main() -> None:
                 risk_delta=risk_delta,
                 budget_fraction=budget_fraction,
                 consistency_check=args.consistency_check,
+                stepwise_thresholds=stepwise_thresholds_obj,
             )
         elif mode == "learned_gate":
             default_gate_path = str(Path(models_root) / "gates" / "learned_gate_latest.npz") if models_root else None
@@ -1376,7 +1613,7 @@ def main() -> None:
                 skip_budget=float(args.adaptive_budget),
             )
         elif mode == "oracle":
-            feature_path = run_teacher(
+            teacher_artifacts = run_teacher(
                 engine,
                 prompts,
                 out_dirs,
@@ -1384,14 +1621,19 @@ def main() -> None:
                 dump_features_dir=dump_features_dir,
                 label_thresholds=label_thresholds,
                 oracle_eval=True,
+                task_name=task,
+                exp_name=exp_name,
             )
         elif mode == "baselines":
             run_baselines(out_dirs, num_steps)
         else:
             raise ValueError(f"Unsupported mode: {mode}")
 
-    if feature_path:
-        print(f"[teacher] token features saved to {feature_path}")
+    if teacher_artifacts:
+        if teacher_artifacts.features_path:
+            print(f"[teacher] token features saved to {teacher_artifacts.features_path}")
+        if teacher_artifacts.quantiles_path:
+            print(f"[teacher] quantiles saved to {teacher_artifacts.quantiles_path}")
 
     if wandb_run is not None:
         try:
