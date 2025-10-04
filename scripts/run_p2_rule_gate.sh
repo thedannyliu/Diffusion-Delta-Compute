@@ -27,6 +27,10 @@ KL_Q=${KL_Q:-}
 STEPWISE_EMA=${STEPWISE_EMA:-}
 STEPWISE_CLIP=${STEPWISE_CLIP:-}
 GAMMA_MARGIN=${GAMMA_MARGIN:-}
+RISK_QUANTILES_PATH=${RISK_QUANTILES_PATH:-}
+RISK_INITIAL_QUANTILE=${RISK_INITIAL_QUANTILE:-0.60}
+RISK_LOW_SUPPORT=${RISK_LOW_SUPPORT:-50}
+RISK_WINDOW=${RISK_WINDOW:-}
 MODE=rule_gate
 # Accept profiles via space-separated PROFILES or comma-separated PROFILES_CSV (preferred for sbatch)
 PROFILES_CSV=${PROFILES_CSV:-"conservative,balanced,aggressive"}
@@ -171,6 +175,13 @@ for PROFILE_NAME in "${PROFILE_LIST[@]}"; do
   RUN_ARGS+=("--stepwise_ema" "$EMA_VALUE" "--stepwise_clip" "$CLIP_VALUE")
   if [[ -n "$KL_Q" ]]; then
     RUN_ARGS+=("--kl_quantile" "$KL_Q")
+  fi
+  RUN_ARGS+=("--risk_initial_quantile" "$RISK_INITIAL_QUANTILE" "--risk_low_support" "$RISK_LOW_SUPPORT")
+  if [[ -n "$RISK_WINDOW" ]]; then
+    RUN_ARGS+=("--risk_window" "$RISK_WINDOW")
+  fi
+  if [[ -n "$RISK_QUANTILES_PATH" ]]; then
+    RUN_ARGS+=("--risk_quantiles_path" "$RISK_QUANTILES_PATH")
   fi
 
   QUANTILES_RESOLVED="$QUANTILES_PATH"

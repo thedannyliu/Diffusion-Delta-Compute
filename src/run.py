@@ -12,6 +12,7 @@ import numpy as np
 
 from src.utils.logging import init_run_logging
 from src.utils.timer import Timer
+from src.utils.decision_logger import DecisionLogger, close_loggers
 from src.engine.base_engine import BaseEngine
 from src.engine.mock_engine import MockDiffusionEngine
 
@@ -27,7 +28,11 @@ from src.probes.metrics import (
 )
 from src.gating.rule_gate import RuleGate, RuleGateConfig, StepGateResult
 from src.gating.learned_gate import LearnedGate, LearnedGateConfig, LearnedGateWeights
-from src.gating.conformal import ConformalRiskCalibrator, compute_risk_score
+from src.gating.conformal import (
+    ConformalRiskCalibrator,
+    StepwiseConformalCalibrator,
+    compute_risk_score,
+)
 from src.gating.budget import BudgetController
 from src.gating.adaptive import AdaptiveScheduler, AdaptiveSchedulerConfig
 from src.gating.rollback import RollbackBuffer
@@ -101,6 +106,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kl_quantile", type=float, default=None, help="Quantile level (0-1) used to derive per-step KL guard thresholds")
     parser.add_argument("--stepwise_ema", type=float, default=None, help="EMA smoothing factor (0-1, high=more smoothing) for stepwise thresholds")
     parser.add_argument("--stepwise_clip", type=str, default=None, help="Comma-separated min,max bounds applied to raw stepwise thresholds")
+    parser.add_argument("--risk_quantiles_path", type=str, default=None, help="Path to precomputed per-step risk thresholds for conformal calibration")
+    parser.add_argument("--risk_initial_quantile", type=float, default=None, help="Fallback quantile used before enough unsafe samples exist")
+    parser.add_argument("--risk_low_support", type=int, default=None, help="Minimum unsafe sample count per step before using per-step threshold")
+    parser.add_argument("--risk_window", type=int, default=None, help="Sliding window size for stepwise conformal calibrator")
     parser.add_argument("--consistency_full_compute", action="store_true", help="Run full-compute baseline and compare outputs; write difference report")
     parser.add_argument("--risk_delta", type=float, default=0.01, help="Target conformal δ bound")
     parser.add_argument("--budget_fraction", type=float, default=1.0, help="Per-step compute budget as fraction of Teacher FLOPs")
@@ -221,6 +230,7 @@ def parse_clip_config(value: Optional[object]) -> Tuple[Optional[float], Optiona
 class TeacherArtifacts:
     features_path: Optional[str] = None
     quantiles_path: Optional[str] = None
+    outputs_path: Optional[str] = None
 
 
 @dataclass
@@ -246,6 +256,19 @@ class StepwiseThresholds:
         if 0 <= step < len(self.gamma_margin):
             return float(self.gamma_margin[step])
         return None
+
+
+def logits_argmax_and_margin(logits: np.ndarray) -> Tuple[List[int], List[float]]:
+    top_indices = np.argmax(logits, axis=-1)
+    sorted_logits = np.sort(logits, axis=-1)
+    top1_vals = sorted_logits[:, -1]
+    if logits.shape[1] > 1:
+        top2_vals = sorted_logits[:, -2]
+    else:
+        top2_vals = np.zeros_like(top1_vals)
+    margins = top1_vals - top2_vals
+    return top_indices.astype(np.int64).tolist(), margins.astype(np.float32).tolist()
+
 
 @dataclass
 class TokenObservables:
@@ -363,6 +386,8 @@ def run_teacher(
     }
     step_token_counts: Dict[int, int] = defaultdict(int)
     features_path: Optional[str] = None
+    teacher_outputs_path = os.path.join(out_dirs["runs"], f"teacher_outputs_{timestamp}.jsonl")
+    teacher_outputs_file = open(teacher_outputs_path, "w", encoding="utf-8")
 
     for prompt_idx, prompt in enumerate(prompts):
         state = engine.encode_prompt(prompt)
@@ -514,6 +539,18 @@ def run_teacher(
         if stability_max is not None:
             stability_lengths.extend(int(x) for x in stability_max.tolist())
         per_seq_latency_ms.append((time.time() - seq_start) * 1000.0)
+
+        if prev_logits is not None:
+            tokens, margins = logits_argmax_and_margin(prev_logits)
+            checksum = float(np.sum(prev_logits)) if prev_logits.size else 0.0
+            record = {
+                "prompt_id": int(prompt_idx),
+                "prompt": prompt,
+                "tokens": tokens,
+                "margins": margins,
+                "logits_checksum": checksum,
+            }
+            teacher_outputs_file.write(json.dumps(record) + "\n")
 
     layer_mse_curves: Dict[int, List[float]] = {}
     mse_steps: List[int] = list(range(1, num_steps)) if num_steps > 1 else []
@@ -682,6 +719,7 @@ def run_teacher(
         "oracle_skip_ratio_mean": float(np.mean(oracle_ratios) if oracle_ratios else -1.0),
         "quantiles_path": quantiles_path,
         "features_path": features_path,
+        "final_outputs_path": teacher_outputs_path,
         "task": task_name,
         "exp_name": exp_name,
         **{f"gpu_{k}": v for k, v in gpu.items()},
@@ -690,7 +728,9 @@ def run_teacher(
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    return TeacherArtifacts(features_path=features_path, quantiles_path=quantiles_path)
+    teacher_outputs_file.close()
+
+    return TeacherArtifacts(features_path=features_path, quantiles_path=quantiles_path, outputs_path=teacher_outputs_path)
 
 
 def run_rule_gate(
@@ -703,6 +743,9 @@ def run_rule_gate(
     budget_fraction: float,
     consistency_check: bool = False,
     stepwise_thresholds: Optional[StepwiseThresholds] = None,
+    calibrator_cfg: Optional[Dict[str, object]] = None,
+    decision_logger: Optional[DecisionLogger] = None,
+    profile: Optional[str] = None,
 ) -> None:
     from src.viz.plots import save_hist
 
@@ -711,7 +754,18 @@ def run_rule_gate(
     freeze_ratios_by_step: Dict[int, List[float]] = defaultdict(list)
 
     gate = RuleGate(cfg)
-    calibrator = ConformalRiskCalibrator(delta=risk_delta, initial_quantile=0.60)
+    calibrator_params = calibrator_cfg or {}
+    calibrator = StepwiseConformalCalibrator(
+        delta=risk_delta,
+        num_steps=num_steps,
+        initial_quantile=float(calibrator_params.get("initial_quantile", 0.60)),
+        ema_alpha=calibrator_params.get("ema_alpha"),
+        clip_min=calibrator_params.get("clip_min"),
+        clip_max=calibrator_params.get("clip_max"),
+        low_support=int(calibrator_params.get("low_support", 50)),
+        window_size=calibrator_params.get("window_size"),
+        init_thresholds=calibrator_params.get("init_thresholds"),
+    )
     budget_controller = BudgetController(budget_fraction=budget_fraction)
     rollback = RollbackBuffer()
     effective_budget_tokens: List[float] = []
@@ -729,7 +783,7 @@ def run_rule_gate(
     sampler = GPUUtilSampler(interval_sec=0.5)
     sampler.start()
 
-    for prompt in prompts:
+    for prompt_idx, prompt in enumerate(prompts):
         state = engine.encode_prompt(prompt)
         prev_hidden: Optional[List[np.ndarray]] = None
         prev_logits: Optional[np.ndarray] = None
@@ -788,8 +842,9 @@ def run_rule_gate(
             risk_scores = compute_risk_score(obs.cosine_norm, obs.delta_l2_norm, obs.kl)
 
             watchdog_mask = (obs.cosine < watchdog_min_cos) | (obs.kl > watchdog_max_kl)
+            watchdog_mask_snapshot = watchdog_mask.copy()
             if np.any(watchdog_mask):
-                calibrator.register(risk_scores, unsafe_mask=watchdog_mask)
+                calibrator.register(step=t, scores=risk_scores, unsafe_mask=watchdog_mask)
                 rollback.restore(state)
                 mask_to_use = None
                 out = engine.step(state, t, compute_mask=None)
@@ -821,7 +876,7 @@ def run_rule_gate(
             skip_stats_rows.append(f"{t},{seq_len},{frozen_tokens},{frozen_ratio:.6f},{num_layers_seen},0")
             freeze_ratios_by_step[t].append(frozen_ratio)
 
-            risk_threshold = calibrator.effective_threshold(risk_scores)
+            risk_threshold = calibrator.effective_threshold(step=t, candidate_scores=risk_scores)
             risk_threshold_history.append(risk_threshold)
             if risk_scores.size > 0:
                 delta_violation_history.append(float(np.mean(risk_scores > risk_threshold)))
@@ -835,7 +890,7 @@ def run_rule_gate(
                     "gamma_margin": float(margin_override if margin_override is not None else cfg.gamma_margin),
                 }
 
-            gate.update(
+            result = gate.update(
                 feats_cos=obs.cosine,
                 feats_dl2=obs.delta_l2,
                 feats_kl=obs.kl,
@@ -850,6 +905,36 @@ def run_rule_gate(
                 delta_l2_override=delta_override,
                 gamma_margin_override=margin_override,
             )
+
+            if decision_logger is not None:
+                freeze_mask = result.freeze_mask
+                if freeze_mask is None:
+                    freeze_mask = np.zeros(out.logits.shape[0], dtype=bool)
+                counters_snapshot = result.counters
+                for token_idx in range(out.logits.shape[0]):
+                    decision_label = "freeze" if bool(freeze_mask[token_idx]) else "keep"
+                    k_applied = cfg.freeze_K if decision_label == "freeze" else 0
+                    decision_logger.log_decision(
+                        prompt_id=prompt_idx,
+                        step=t,
+                        token_idx=token_idx,
+                        decision=decision_label,
+                        k_applied=k_applied,
+                        risk=float(risk_scores[token_idx]),
+                        risk_threshold=float(risk_threshold),
+                        margin=float(obs.margin[token_idx]),
+                        kl=float(obs.kl[token_idx]),
+                        one_minus_cos=float(1.0 - obs.cosine[token_idx]),
+                        delta_l2=float(obs.delta_l2[token_idx]),
+                        delta_l2_norm=float(obs.delta_l2_norm[token_idx]),
+                        sigma=float(obs.sigma[token_idx]),
+                        layer_band="global",
+                        profile=profile,
+                        extras={
+                            "watchdog_triggered": bool(watchdog_mask_snapshot[token_idx]),
+                            "counter": int(counters_snapshot[token_idx]),
+                        },
+                    )
 
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
             prev_logits = out.logits.copy()
@@ -876,6 +961,17 @@ def run_rule_gate(
             f.write("step,seq_len,frozen_tokens,frozen_ratio,num_layers,skipped_layers\n")
             for row in skip_stats_rows:
                 f.write(row + "\n")
+
+        if decision_logger is not None and prev_logits is not None:
+            tokens, margins = logits_argmax_and_margin(prev_logits)
+            checksum = float(np.sum(prev_logits)) if prev_logits.size else 0.0
+            decision_logger.log_final_output(
+                prompt_id=prompt_idx,
+                tokens=tokens,
+                margins=margins,
+                logits_checksum=checksum,
+                extras={"prompt_length": len(prompt)},
+            )
 
         if consistency_check:
             # Run full-compute baseline for the same prompt and compare final token argmax
@@ -949,6 +1045,8 @@ def run_rule_gate(
         "risk_delta": float(risk_delta),
         "stepwise_thresholds": thresholds_manifest_path,
         "stepwise_thresholds_source": stepwise_thresholds.source_path if stepwise_thresholds is not None else None,
+        "decision_log": decision_logger.decision_path if decision_logger is not None else None,
+        "final_outputs_path": decision_logger.final_outputs_path if decision_logger is not None else None,
         **{f"gpu_{k}": v for k, v in gpu.items()},
     }
     with open(os.path.join(out_dirs["runs"], f"rule_gate_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
@@ -966,6 +1064,9 @@ def run_learned_gate(
     risk_delta: float,
     budget_fraction: float,
     consistency_check: bool = False,
+    calibrator_cfg: Optional[Dict[str, object]] = None,
+    decision_logger: Optional[DecisionLogger] = None,
+    profile: Optional[str] = None,
 ) -> None:
     from src.viz.plots import save_hist
 
@@ -980,7 +1081,18 @@ def run_learned_gate(
     total_start = time.time()
     sampler = GPUUtilSampler(interval_sec=0.5)
     sampler.start()
-    calibrator = ConformalRiskCalibrator(delta=risk_delta, initial_quantile=0.60)
+    calibrator_params = calibrator_cfg or {}
+    calibrator = StepwiseConformalCalibrator(
+        delta=risk_delta,
+        num_steps=num_steps,
+        initial_quantile=float(calibrator_params.get("initial_quantile", 0.60)),
+        ema_alpha=calibrator_params.get("ema_alpha"),
+        clip_min=calibrator_params.get("clip_min"),
+        clip_max=calibrator_params.get("clip_max"),
+        low_support=int(calibrator_params.get("low_support", 50)),
+        window_size=calibrator_params.get("window_size"),
+        init_thresholds=calibrator_params.get("init_thresholds"),
+    )
     budget_controller = BudgetController(budget_fraction=budget_fraction)
     risk_threshold_history: List[float] = []
     delta_violation_history: List[float] = []
@@ -1035,7 +1147,7 @@ def run_learned_gate(
 
             watchdog_mask = (obs.cosine < watchdog_min_cos) | (obs.kl > watchdog_max_kl)
             if np.any(watchdog_mask):
-                calibrator.register(risk_scores, unsafe_mask=watchdog_mask)
+                calibrator.register(step=t, scores=risk_scores, unsafe_mask=watchdog_mask)
                 mask_to_use = None
                 out = engine.step(state, t, compute_mask=None)
                 obs = compute_token_observables(
@@ -1066,7 +1178,7 @@ def run_learned_gate(
                 ],
                 axis=-1,
             ).astype(np.float32)
-            risk_threshold = calibrator.effective_threshold(risk_scores)
+            risk_threshold = calibrator.effective_threshold(step=t, candidate_scores=risk_scores)
             risk_threshold_history.append(risk_threshold)
             if risk_scores.size > 0:
                 delta_violation_history.append(float(np.mean(risk_scores > risk_threshold)))
@@ -1082,6 +1194,38 @@ def run_learned_gate(
             if gate_result.probabilities is not None:
                 prob_samples.extend(gate_result.probabilities.tolist())
 
+            if decision_logger is not None:
+                freeze_mask = gate_result.freeze_mask
+                if freeze_mask is None:
+                    freeze_mask = np.zeros(out.logits.shape[0], dtype=bool)
+                probabilities = gate_result.probabilities if gate_result.probabilities is not None else np.zeros(out.logits.shape[0], dtype=np.float32)
+                counters_snapshot = gate_result.counters
+                for token_idx in range(out.logits.shape[0]):
+                    decision_label = "freeze" if bool(freeze_mask[token_idx]) else "keep"
+                    k_applied = gate.cfg.freeze_K if decision_label == "freeze" else 0
+                    decision_logger.log_decision(
+                        prompt_id=prompt_idx,
+                        step=t,
+                        token_idx=token_idx,
+                        decision=decision_label,
+                        k_applied=k_applied,
+                        risk=float(risk_scores[token_idx]),
+                        risk_threshold=float(risk_threshold),
+                        margin=float(obs.margin[token_idx]),
+                        kl=float(obs.kl[token_idx]),
+                        one_minus_cos=float(1.0 - obs.cosine[token_idx]),
+                        delta_l2=float(obs.delta_l2[token_idx]),
+                        delta_l2_norm=float(obs.delta_l2_norm[token_idx]),
+                        sigma=float(obs.sigma[token_idx]),
+                        layer_band="global",
+                        profile=profile,
+                        extras={
+                            "watchdog_triggered": bool(watchdog_mask_snapshot[token_idx]),
+                            "probability": float(probabilities[token_idx]),
+                            "counter": int(counters_snapshot[token_idx]),
+                        },
+                    )
+
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
             prev_logits = out.logits.copy()
 
@@ -1091,6 +1235,17 @@ def run_learned_gate(
         savings_ratios.append(float(savings))
         effective_budget_tokens.append(1.0 - savings)
         aggregates.append({"mode": "learned_gate", "prompt_len": len(prompt), "savings": float(savings)})
+
+        if decision_logger is not None and prev_logits is not None:
+            tokens, margins = logits_argmax_and_margin(prev_logits)
+            checksum = float(np.sum(prev_logits)) if prev_logits.size else 0.0
+            decision_logger.log_final_output(
+                prompt_id=prompt_idx,
+                tokens=tokens,
+                margins=margins,
+                logits_checksum=checksum,
+                extras={"prompt_length": len(prompt)},
+            )
 
         if consistency_check:
             baseline_state = engine.encode_prompt(prompt)
@@ -1145,6 +1300,8 @@ def run_learned_gate(
         "budget_fraction": float(np.mean(effective_budget_tokens)) if effective_budget_tokens else None,
         "budget_fraction_target": float(budget_fraction),
         "risk_delta": float(risk_delta),
+        "decision_log": decision_logger.decision_path if decision_logger is not None else None,
+        "final_outputs_path": decision_logger.final_outputs_path if decision_logger is not None else None,
         **{f"gpu_{k}": v for k, v in gpu.items()},
     }
     with open(os.path.join(out_dirs["runs"], f"learned_gate_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
@@ -1377,6 +1534,37 @@ def main() -> None:
     quantiles_path = None
     if quantiles_path_raw:
         quantiles_path = quantiles_path_raw if os.path.isabs(quantiles_path_raw) else os.path.abspath(os.path.join(repo_root, quantiles_path_raw))
+    risk_quantiles_path_raw = coalesce(args.risk_quantiles_path, cfg.get("risk_quantiles_path"), stepwise_cfg.get("risk_quantiles_path"))
+    risk_initial_quantile_raw = coalesce(args.risk_initial_quantile, cfg.get("risk_initial_quantile"), stepwise_cfg.get("risk_initial_quantile"), 0.60)
+    risk_initial_quantile = float(risk_initial_quantile_raw) if risk_initial_quantile_raw is not None else 0.60
+    risk_low_support_raw = coalesce(args.risk_low_support, cfg.get("risk_low_support"), stepwise_cfg.get("risk_low_support"), 50)
+    risk_low_support = int(risk_low_support_raw) if risk_low_support_raw is not None else 50
+    risk_window_raw = coalesce(args.risk_window, cfg.get("risk_window"), stepwise_cfg.get("risk_window"))
+    risk_window = int(risk_window_raw) if risk_window_raw else None
+    risk_quantiles_path = None
+    if risk_quantiles_path_raw:
+        risk_quantiles_path = risk_quantiles_path_raw if os.path.isabs(risk_quantiles_path_raw) else os.path.abspath(os.path.join(repo_root, risk_quantiles_path_raw))
+    risk_init_thresholds = None
+    if risk_quantiles_path and os.path.exists(risk_quantiles_path):
+        with open(risk_quantiles_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        steps_block = data.get("steps") if isinstance(data, dict) else None
+        if isinstance(steps_block, dict):
+            risk_init_thresholds = {int(step): float(val) for step, val in steps_block.items() if val is not None}
+        else:
+            risk_init_thresholds = {int(step): float(val) for step, val in data.items() if val is not None}
+
+    calibrator_cfg = {
+        "initial_quantile": risk_initial_quantile,
+        "ema_alpha": stepwise_ema,
+        "clip_min": clip_min,
+        "clip_max": clip_max,
+        "low_support": risk_low_support,
+        "window_size": risk_window,
+        "init_thresholds": risk_init_thresholds,
+    }
+    risk_manifest_cfg = dict(calibrator_cfg)
+    risk_manifest_cfg["risk_quantiles_path"] = risk_quantiles_path
 
     outputs_root = str(outputs_root)
     run_dir = ensure_output_dirs(outputs_root, phase=phase, mode=mode, engine=engine_name, exp_name=exp_name)
@@ -1417,6 +1605,7 @@ def main() -> None:
             "clip_min": clip_min,
             "clip_max": clip_max,
         },
+        "risk_calibrator": risk_manifest_cfg,
     }
     save_manifest(run_dir, {
         "args": vars(args),
@@ -1475,165 +1664,182 @@ def main() -> None:
     prompts = load_prompts(num_prompts, task, data_root)
     out_dirs = {"figures": os.path.join(run_dir, "figures"), "runs": os.path.join(run_dir, "runs")}
 
-    teacher_artifacts: Optional[TeacherArtifacts] = None
-    with Timer(f"run-{mode}"):
-        if mode == "teacher":
-            teacher_artifacts = run_teacher(
-                engine,
-                prompts,
-                out_dirs,
-                num_steps,
-                dump_features_dir=dump_features_dir,
-                label_thresholds=label_thresholds,
-                oracle_eval=bool(args.oracle_eval or cfg.get("oracle_eval", False)),
-                task_name=task,
-                exp_name=exp_name,
-            )
-            if args.consistency_full_compute and engine_name == "d2f":
-                # Full-compute twice to verify stability; write difference report
-                diffs_csv = os.path.join(out_dirs["runs"], f"consistency_diffs_{time.strftime('%Y%m%d_%H%M%S')}.csv")
-                with open(diffs_csv, "w", encoding="utf-8") as f:
-                    f.write("prompt_idx,step,logits_match,hidden_cos_mean\n")
-                    for pi, prompt in enumerate(prompts):
-                        s1 = engine.encode_prompt(prompt)
-                        s2 = engine.encode_prompt(prompt)
-                        prev1_h = prev2_h = None
-                        prev1_z = prev2_z = None
-                        for t in range(num_steps):
-                            o1 = engine.step(s1, t, compute_mask=None)
-                            o2 = engine.step(s2, t, compute_mask=None)
-                            logits_match = int(np.allclose(o1.logits, o2.logits, atol=1e-6))
-                            hidden_cos_mean = 1.0
-                            if prev1_h is not None and prev2_h is not None:
-                                c1 = cosine_similarity_tokens(o1.hidden_by_layer, prev1_h)
-                                c2 = cosine_similarity_tokens(o2.hidden_by_layer, prev2_h)
-                                hidden_cos_mean = float(0.5 * (np.mean(c1) + np.mean(c2)))
-                            f.write(f"{pi},{t},{logits_match},{hidden_cos_mean:.6f}\n")
-                            prev1_h = [h.copy() for h in o1.hidden_by_layer]
-                            prev2_h = [h.copy() for h in o2.hidden_by_layer]
-                            prev1_z = o1.logits.copy()
-                            prev2_z = o2.logits.copy()
-        elif mode == "rule_gate":
-            stepwise_thresholds_obj: Optional[StepwiseThresholds] = None
-            if quantiles_path:
-                if not os.path.exists(quantiles_path):
-                    raise FileNotFoundError(f"Quantiles file not found: {quantiles_path}")
-                if cos_quantile_level is None or delta_quantile_level is None:
-                    raise ValueError("Stepwise thresholds require one_minus_cos_quantile and delta_l2_quantile")
-                table = StepQuantileTable.load(quantiles_path)
-                available_steps = table.num_steps if table.num_steps is not None else num_steps
-                step_count = min(num_steps, int(available_steps))
-                raw_one_minus_cos = [table.value("one_minus_cos", step, cos_quantile_level) for step in range(step_count)]
-                raw_delta = [table.value("delta_l2_norm", step, delta_quantile_level) for step in range(step_count)]
-                one_minus_cos_vals = clip_sequence(raw_one_minus_cos, clip_min, clip_max)
-                delta_vals = clip_sequence(raw_delta, clip_min, clip_max)
-                if stepwise_ema is not None:
-                    one_minus_cos_vals = apply_ema(one_minus_cos_vals, stepwise_ema)
-                    delta_vals = apply_ema(delta_vals, stepwise_ema)
-                cosine_tau_steps = [float(np.clip(1.0 - val, -1.0, 1.0)) for val in one_minus_cos_vals]
-                delta_l2_steps = [float(max(val, 0.0)) for val in delta_vals]
-                gamma_steps = [float(gamma_margin)] * step_count
-                stepwise_thresholds_obj = StepwiseThresholds(
-                    cosine_tau=cosine_tau_steps,
-                    delta_l2_rho=delta_l2_steps,
-                    gamma_margin=gamma_steps,
-                    source_path=quantiles_path,
-                )
-                if kl_quantile_level is not None:
-                    kl_values = [table.value("kl", step, kl_quantile_level) for step in range(step_count)]
-                    kl_values = clip_sequence(kl_values, clip_min, clip_max)
-                    if stepwise_ema is not None:
-                        kl_values = apply_ema(kl_values, stepwise_ema)
-                    if kl_values:
-                        watchdog_max_kl = max(float(max(kl_values)), watchdog_max_kl)
-                        resolved_manifest["rule_gate"]["watchdog_max_kl"] = watchdog_max_kl
-                print(f"[rule_gate] Loaded stepwise thresholds from {quantiles_path} (steps={step_count})")
+    decision_loggers: List[DecisionLogger] = []
+    decision_logger: Optional[DecisionLogger] = None
+    if mode in {"rule_gate", "learned_gate"}:
+        decision_logger = DecisionLogger(run_dir, mode, os.path.basename(run_dir))
+        decision_loggers.append(decision_logger)
 
-            rule_cfg = RuleGateConfig(
-                cosine_tau=tau,
-                delta_l2_rho=rho,
-                consecutive_m=consecutive_m,
-                freeze_K=freeze_K,
-                watchdog_min_cos=watchdog_min_cos,
-                watchdog_max_kl=watchdog_max_kl,
-                layer_recompute_M=layer_recompute_M,
-                gamma_margin=gamma_margin,
-            )
-            run_rule_gate(
-                engine,
-                prompts,
-                out_dirs,
-                num_steps,
-                rule_cfg,
-                risk_delta=risk_delta,
-                budget_fraction=budget_fraction,
-                consistency_check=args.consistency_check,
-                stepwise_thresholds=stepwise_thresholds_obj,
-            )
-        elif mode == "learned_gate":
-            default_gate_path = str(Path(models_root) / "gates" / "learned_gate_latest.npz") if models_root else None
-            weights_path = coalesce(args.learned_gate_weights, cfg.get("learned_gate_weights"), default_gate_path)
-            if not weights_path or not os.path.exists(weights_path):
-                raise FileNotFoundError(f"Learned gate weights not found at {weights_path}")
-            weights = LearnedGateWeights.from_npz(weights_path)
-            threshold_override = coalesce(args.learned_gate_threshold, cfg.get("learned_gate_threshold"))
-            if threshold_override is not None:
-                weights.threshold = float(threshold_override)
-            learned_gate_cfg = LearnedGateConfig(
-                freeze_K=int(coalesce(args.learned_gate_freeze_K, cfg.get("learned_gate_freeze_K"), freeze_K)),
-                min_consecutive=int(coalesce(args.learned_gate_min_consecutive, cfg.get("learned_gate_min_consecutive"), consecutive_m)),
-            )
-            gate = LearnedGate(weights, learned_gate_cfg)
-            run_learned_gate(
-                engine,
-                prompts,
-                out_dirs,
-                num_steps,
-                gate,
-                watchdog_min_cos=watchdog_min_cos,
-                watchdog_max_kl=watchdog_max_kl,
-                risk_delta=risk_delta,
-                budget_fraction=budget_fraction,
-                consistency_check=args.consistency_check,
-            )
-        elif mode == "adaptive":
-            scheduler_cfg = AdaptiveSchedulerConfig(
-                lte_eps=float(args.lte_eps),
-                min_consecutive=int(args.lte_min_consec),
-                max_stride=int(args.max_stride),
-                base_stride=1,
-            )
-            run_adaptive(
-                engine,
-                prompts,
-                out_dirs,
-                num_steps,
-                scheduler_cfg=scheduler_cfg,
-                risk_delta=risk_delta,
-                skip_budget=float(args.adaptive_budget),
-            )
-        elif mode == "oracle":
-            teacher_artifacts = run_teacher(
-                engine,
-                prompts,
-                out_dirs,
-                num_steps,
-                dump_features_dir=dump_features_dir,
-                label_thresholds=label_thresholds,
-                oracle_eval=True,
-                task_name=task,
-                exp_name=exp_name,
-            )
-        elif mode == "baselines":
-            run_baselines(out_dirs, num_steps)
-        else:
-            raise ValueError(f"Unsupported mode: {mode}")
+    teacher_artifacts: Optional[TeacherArtifacts] = None
+    try:
+        with Timer(f"run-{mode}"):
+            if mode == "teacher":
+                teacher_artifacts = run_teacher(
+                    engine,
+                    prompts,
+                    out_dirs,
+                    num_steps,
+                    dump_features_dir=dump_features_dir,
+                    label_thresholds=label_thresholds,
+                    oracle_eval=bool(args.oracle_eval or cfg.get("oracle_eval", False)),
+                    task_name=task,
+                    exp_name=exp_name,
+                )
+                if args.consistency_full_compute and engine_name == "d2f":
+                    # Full-compute twice to verify stability; write difference report
+                    diffs_csv = os.path.join(out_dirs["runs"], f"consistency_diffs_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+                    with open(diffs_csv, "w", encoding="utf-8") as f:
+                        f.write("prompt_idx,step,logits_match,hidden_cos_mean\n")
+                        for pi, prompt in enumerate(prompts):
+                            s1 = engine.encode_prompt(prompt)
+                            s2 = engine.encode_prompt(prompt)
+                            prev1_h = prev2_h = None
+                            prev1_z = prev2_z = None
+                            for t in range(num_steps):
+                                o1 = engine.step(s1, t, compute_mask=None)
+                                o2 = engine.step(s2, t, compute_mask=None)
+                                logits_match = int(np.allclose(o1.logits, o2.logits, atol=1e-6))
+                                hidden_cos_mean = 1.0
+                                if prev1_h is not None and prev2_h is not None:
+                                    c1 = cosine_similarity_tokens(o1.hidden_by_layer, prev1_h)
+                                    c2 = cosine_similarity_tokens(o2.hidden_by_layer, prev2_h)
+                                    hidden_cos_mean = float(0.5 * (np.mean(c1) + np.mean(c2)))
+                                f.write(f"{pi},{t},{logits_match},{hidden_cos_mean:.6f}\n")
+                                prev1_h = [h.copy() for h in o1.hidden_by_layer]
+                                prev2_h = [h.copy() for h in o2.hidden_by_layer]
+                                prev1_z = o1.logits.copy()
+                                prev2_z = o2.logits.copy()
+            elif mode == "rule_gate":
+                stepwise_thresholds_obj: Optional[StepwiseThresholds] = None
+                if quantiles_path:
+                    if not os.path.exists(quantiles_path):
+                        raise FileNotFoundError(f"Quantiles file not found: {quantiles_path}")
+                    if cos_quantile_level is None or delta_quantile_level is None:
+                        raise ValueError("Stepwise thresholds require one_minus_cos_quantile and delta_l2_quantile")
+                    table = StepQuantileTable.load(quantiles_path)
+                    available_steps = table.num_steps if table.num_steps is not None else num_steps
+                    step_count = min(num_steps, int(available_steps))
+                    raw_one_minus_cos = [table.value("one_minus_cos", step, cos_quantile_level) for step in range(step_count)]
+                    raw_delta = [table.value("delta_l2_norm", step, delta_quantile_level) for step in range(step_count)]
+                    one_minus_cos_vals = clip_sequence(raw_one_minus_cos, clip_min, clip_max)
+                    delta_vals = clip_sequence(raw_delta, clip_min, clip_max)
+                    if stepwise_ema is not None:
+                        one_minus_cos_vals = apply_ema(one_minus_cos_vals, stepwise_ema)
+                        delta_vals = apply_ema(delta_vals, stepwise_ema)
+                    cosine_tau_steps = [float(np.clip(1.0 - val, -1.0, 1.0)) for val in one_minus_cos_vals]
+                    delta_l2_steps = [float(max(val, 0.0)) for val in delta_vals]
+                    gamma_steps = [float(gamma_margin)] * step_count
+                    stepwise_thresholds_obj = StepwiseThresholds(
+                        cosine_tau=cosine_tau_steps,
+                        delta_l2_rho=delta_l2_steps,
+                        gamma_margin=gamma_steps,
+                        source_path=quantiles_path,
+                    )
+                    if kl_quantile_level is not None:
+                        kl_values = [table.value("kl", step, kl_quantile_level) for step in range(step_count)]
+                        kl_values = clip_sequence(kl_values, clip_min, clip_max)
+                        if stepwise_ema is not None:
+                            kl_values = apply_ema(kl_values, stepwise_ema)
+                        if kl_values:
+                            watchdog_max_kl = max(float(max(kl_values)), watchdog_max_kl)
+                            resolved_manifest["rule_gate"]["watchdog_max_kl"] = watchdog_max_kl
+                    print(f"[rule_gate] Loaded stepwise thresholds from {quantiles_path} (steps={step_count})")
+
+                rule_cfg = RuleGateConfig(
+                    cosine_tau=tau,
+                    delta_l2_rho=rho,
+                    consecutive_m=consecutive_m,
+                    freeze_K=freeze_K,
+                    watchdog_min_cos=watchdog_min_cos,
+                    watchdog_max_kl=watchdog_max_kl,
+                    layer_recompute_M=layer_recompute_M,
+                    gamma_margin=gamma_margin,
+                )
+                run_rule_gate(
+                    engine,
+                    prompts,
+                    out_dirs,
+                    num_steps,
+                    rule_cfg,
+                    risk_delta=risk_delta,
+                    budget_fraction=budget_fraction,
+                    consistency_check=args.consistency_check,
+                    stepwise_thresholds=stepwise_thresholds_obj,
+                    calibrator_cfg=calibrator_cfg,
+                    decision_logger=decision_logger,
+                    profile=args.profile if hasattr(args, "profile") else None,
+                )
+            elif mode == "learned_gate":
+                default_gate_path = str(Path(models_root) / "gates" / "learned_gate_latest.npz") if models_root else None
+                weights_path = coalesce(args.learned_gate_weights, cfg.get("learned_gate_weights"), default_gate_path)
+                if not weights_path or not os.path.exists(weights_path):
+                    raise FileNotFoundError(f"Learned gate weights not found at {weights_path}")
+                weights = LearnedGateWeights.from_npz(weights_path)
+                threshold_override = coalesce(args.learned_gate_threshold, cfg.get("learned_gate_threshold"))
+                if threshold_override is not None:
+                    weights.threshold = float(threshold_override)
+                learned_gate_cfg = LearnedGateConfig(
+                    freeze_K=int(coalesce(args.learned_gate_freeze_K, cfg.get("learned_gate_freeze_K"), freeze_K)),
+                    min_consecutive=int(coalesce(args.learned_gate_min_consecutive, cfg.get("learned_gate_min_consecutive"), consecutive_m)),
+                )
+                gate = LearnedGate(weights, learned_gate_cfg)
+                run_learned_gate(
+                    engine,
+                    prompts,
+                    out_dirs,
+                    num_steps,
+                    gate,
+                    watchdog_min_cos=watchdog_min_cos,
+                    watchdog_max_kl=watchdog_max_kl,
+                    risk_delta=risk_delta,
+                    budget_fraction=budget_fraction,
+                    consistency_check=args.consistency_check,
+                    calibrator_cfg=calibrator_cfg,
+                    decision_logger=decision_logger,
+                    profile=args.profile if hasattr(args, "profile") else None,
+                )
+            elif mode == "adaptive":
+                scheduler_cfg = AdaptiveSchedulerConfig(
+                    lte_eps=float(args.lte_eps),
+                    min_consecutive=int(args.lte_min_consec),
+                    max_stride=int(args.max_stride),
+                    base_stride=1,
+                )
+                run_adaptive(
+                    engine,
+                    prompts,
+                    out_dirs,
+                    num_steps,
+                    scheduler_cfg=scheduler_cfg,
+                    risk_delta=risk_delta,
+                    skip_budget=float(args.adaptive_budget),
+                )
+            elif mode == "oracle":
+                teacher_artifacts = run_teacher(
+                    engine,
+                    prompts,
+                    out_dirs,
+                    num_steps,
+                    dump_features_dir=dump_features_dir,
+                    label_thresholds=label_thresholds,
+                    oracle_eval=True,
+                    task_name=task,
+                    exp_name=exp_name,
+                )
+            elif mode == "baselines":
+                run_baselines(out_dirs, num_steps)
+            else:
+                raise ValueError(f"Unsupported mode: {mode}")
+    finally:
+        close_loggers(decision_loggers)
 
     if teacher_artifacts:
         if teacher_artifacts.features_path:
             print(f"[teacher] token features saved to {teacher_artifacts.features_path}")
         if teacher_artifacts.quantiles_path:
             print(f"[teacher] quantiles saved to {teacher_artifacts.quantiles_path}")
+        if teacher_artifacts.outputs_path:
+            print(f"[teacher] final outputs saved to {teacher_artifacts.outputs_path}")
 
     if wandb_run is not None:
         try:

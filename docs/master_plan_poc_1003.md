@@ -208,11 +208,15 @@ Five detailed samples (trace):
 Additional v2 details (kept):
 - Attention-graph-aware freezing: cluster tokens via attention centrality/community; freeze clusters jointly; keep anchors live. Provide community-level skip tables and failure-gallery heatmaps.
 - Budget-aware controller: accept β as fraction of Teacher FLOPs; score candidate skips by expected_FLOPs_saved/risk and select greedily.
+- **資料切分（Train/Calibration/Test）**：以 prompt 為單位劃分 60/20/20。Train 用於 gate 訓練與特徵正規化；Calibration 只用於估 per-step `q_δ^(t)`；Test 才跑 KPI 與 Pareto 報告。
+- **Mondrian conformal**：對每個步 t 的 unsafe 子集 `U_t` 取 `k_t = ceil((1-δ)(|U_t|+1))` 的 order statistic 得 `q_δ^(t)`，再套 EMA(α≈0.9) 與 clip([p10,p99])。若該步樣本數不足（<50），退回鄰近步或全域 quantile 並標記 `low_support=true`。
 
 Outputs to keep:
 - Skip ratios (token×layer×step), latency p50/p90, throughput, true FLOPs rel.
 - δ_frozen + coverage, consistency, rollback stats.
 - Micro-perf: unfrozen_ratio → step() latency curve; mark non-linearity threshold.
+- **Decision logging**：每個 token×step 的 gate 決策寫入 `reports/<run>/runs/decisions/rule_gate_decisions_<ts>.jsonl`（含 risk、margin、KL、q_δ^(t)、decision、K_applied、watchdog flag、counter），並輸出 `rule_gate_final_outputs_<ts>.jsonl`（最終 argmax/margin）。
+- **δ_frozen 離線評估**：執行 `scripts/eval_delta_frozen.py --decisions <path> --teacher_outputs <teacher_jsonl> --gate_outputs <gate_jsonl> --margin_threshold 0.07` 產生 δ_frozen 與 coverage（含 95% CI、per-step breakdown）。
 
 Five detailed samples (trace):
 - Add `--num_prompts 5 --consistency_check` to emit per-prompt skip_stats_*.csv and a consistency comparison against a full-compute baseline. Archive under reports/artifacts/traces/P2/{dataset}/.
@@ -230,6 +234,7 @@ Training/calibration details (v2 retained, reconciled):
 - Split by prompts; early stop on AUROC and monitor risk-calibrated precision.
 - Handle class imbalance (focal or pos_weight); sweep thresholds to populate Compute-AUC.
 - Conformal δ matching §8; optional sequential SPRT α=β=0.005.
+- 決策/最終輸出記錄與 P2 相同：decision log `learned_gate_decisions_<ts>.jsonl`、最終 `learned_gate_final_outputs_<ts>.jsonl`，供離線 δ_frozen 與 Teacher 對照。
 
 Operating targets (dataset):
 - Wikitext-2: precision ≥0.98, skip 10–15%, δ_frozen ≤0.5–1.0%.
@@ -280,7 +285,7 @@ Run commands (local, example)
   - Trace 5: python -m src.run --mode teacher --config configs/p1_smoke.yaml --task wikitext --num_prompts 5 --consistency_full_compute --exp_name wikitext_trace5
   - Repeat for lambada (2000) and gsm8k (1500).
 - P2 Rule gate (risk + budget):
-  - Wikitext: python -m src.run --mode rule_gate --config configs/p2_smoke.yaml --task wikitext --num_prompts 2000 --profile balanced --risk_delta 0.005 --budget_fraction 0.60
+  - Wikitext: python -m src.run --mode rule_gate --config configs/p2_smoke.yaml --task wikitext --num_prompts 2000 --profile balanced --risk_delta 0.005 --budget_fraction 0.60 --risk_initial_quantile 0.60 --risk_low_support 50
   - Trace 5: add --num_prompts 5 --consistency_check --exp_name wikitext_rule_trace5
   - LAMBADA: use --profile conservative --risk_delta 0.0075; GSM8K: balanced, 0.010.
 - P3 Learned gate (train+eval):
@@ -299,6 +304,7 @@ What to save per run
 - Risk: δ_frozen + coverage; risk threshold history; rollback stats.
 - Performance: latency mean/p50/p90, throughput, GPU util, true FLOPs rel.
 - Visuals: heatmaps/histograms; Pareto; Compute-AUC; skip-regret; failure gallery.
+- Risk validation: run `scripts/eval_delta_frozen.py --decisions <decisions.jsonl> --teacher_outputs <teacher_outputs.jsonl> --gate_outputs <gate_outputs.jsonl>` 產出 δ_frozen 報告（含 95% CI / per-step breakdown），並將結果放入報告附件。
 
 Trace 5 per dataset per phase
 - Keep 5 per-prompt detailed artifacts: for P1/P2/P3, capture skip_stats_*.csv and consistency diffs (where applicable). For P4, archive LTE/risk/stride traces and summary. Store under reports/artifacts/traces/P{phase}/{dataset}/ with exp_name suffix *_trace5.
@@ -334,6 +340,7 @@ Each wrapper:
 - Per-layer time share (Teacher vs Gate) to prove costly layers throttled.
 - Layer×step heatmaps; hist/violin; ROC/PR & calibration (P3).
 - Compute-AUC & skip-regret with 95% CI; failure gallery.
+- δ_frozen 報告：overall + per-step δ_frozen、coverage、95% Wilson CI、unsafe 類型（mismatch / low-margin / watchdog）拆解。
 
 Known gaps fixed (from v2; keep for tracking):
 - final_token_consistency now correct and coverage recorded.
@@ -360,6 +367,7 @@ Deliverables (v2, kept):
 - Artifacts: Oracle/baseline Pareto plots, Quality@Budget curves, OOD breakdowns, microbench sweeps, budget logs.
 - Cross-model evidence across ≥2 dLLM architectures and decoding settings.
 - W&B dashboard and reproducible report via scripts/make_report.sh.
+- Decision log + δ_frozen 離線報告：保留 `runs/decisions/*.jsonl`、`*_final_outputs_*.jsonl` 與 `scripts/eval_delta_frozen.py` 的評估結果，確保 risk 守備可追溯。
 
 ---
 
@@ -386,4 +394,3 @@ FLOPs_attn ≈ 2L·H·d_k·S²; FLOPs_ffn ≈ 2L·S·d·d_ff. Use measured per-l
 - KL: KL(softmax z_t || softmax z_{t-1}).
 - entropy, margin: uncertainty & top-1 confidence gap.
 - attention centrality: total attention mass received by a token.
-
