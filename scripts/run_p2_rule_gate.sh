@@ -21,7 +21,8 @@ RISK_DELTA=${RISK_DELTA:-}
 BUDGET_FRACTION=${BUDGET_FRACTION:-}
 LAYER_M=${LAYER_M:-}
 MODE=rule_gate
-PROFILES=${PROFILES:-"conservative balanced aggressive"}
+# Accept profiles via space-separated PROFILES or comma-separated PROFILES_CSV (preferred for sbatch)
+PROFILES_CSV=${PROFILES_CSV:-"conservative,balanced,aggressive"}
 
 CLI_ARGS=("--mode" "$MODE" "--config" "$CONFIG_PATH")
 if [[ -n "$ENGINE" ]]; then
@@ -57,10 +58,30 @@ fi
 
 CLI_ARGS+=("$@")
 
+# Capture an explicit exp_name, if provided on CLI, so we can suffix per-profile
+BASE_EXP_NAME=""
+for ((i=0; i<${#CLI_ARGS[@]}; i++)); do
+  if [[ "${CLI_ARGS[$i]}" == "--exp_name" ]] && (( i+1 < ${#CLI_ARGS[@]} )); then
+    BASE_EXP_NAME="${CLI_ARGS[$((i+1))]}"
+    break
+  fi
+done
+
 echo "[P2] Running rule-based gate with config: $CONFIG_PATH (python=$PYTHON)"
 pushd "$PROJECT_ROOT" >/dev/null
 
-for PROFILE_NAME in $PROFILES; do
+# Build profile list (prefer PROFILES_CSV over PROFILES to avoid inherited env overriding)
+if [[ -n "${PROFILES_CSV:-}" ]]; then
+  IFS=',' read -r -a PROFILE_LIST <<<"$PROFILES_CSV"
+elif [[ -n "${PROFILES:-}" ]]; then
+  read -r -a PROFILE_LIST <<<"$PROFILES"
+else
+  IFS=',' read -r -a PROFILE_LIST <<<"conservative,balanced,aggressive"
+fi
+
+echo "[P2] Profiles to run: ${PROFILE_LIST[*]}"
+set +e
+for PROFILE_NAME in "${PROFILE_LIST[@]}"; do
   case "$PROFILE_NAME" in
     conservative)
       TAU=${TAU_CONSERVATIVE:-0.97}
@@ -85,9 +106,27 @@ for PROFILE_NAME in $PROFILES; do
       continue
       ;;
   esac
-  RUN_ARGS=("${CLI_ARGS[@]}" "--tau" "$TAU" "--rho" "$RHO" "--m" "$M_CONS" "--freeze_K" "$K_CONS" "--exp_name" "wikitext_rule_gate_$PROFILE_NAME")
+  # Compose per-profile exp_name (preserve user-provided base if present)
+  if [[ -n "$BASE_EXP_NAME" ]]; then
+    EXP_NAME_COMBINED="${BASE_EXP_NAME}_${PROFILE_NAME}"
+  else
+    EXP_NAME_COMBINED="rule_gate_${PROFILE_NAME}"
+  fi
+
+  # Always pass --profile to downstream to aid reporting/config selection
+  RUN_ARGS=(
+    "${CLI_ARGS[@]}"
+    "--profile" "$PROFILE_NAME"
+    "--tau" "$TAU" "--rho" "$RHO" "--m" "$M_CONS" "--freeze_K" "$K_CONS"
+    "--exp_name" "$EXP_NAME_COMBINED"
+  )
   echo "[P2] PROFILE=$PROFILE_NAME tau=$TAU rho=$RHO m=$M_CONS K=$K_CONS"
   "$PYTHON" -m src.run "${RUN_ARGS[@]}"
+  rc=$?
+  if [[ $rc -ne 0 ]]; then
+    echo "[P2] PROFILE=$PROFILE_NAME failed with exit code $rc; continuing..." >&2
+  fi
 done
+set -e
 
 popd >/dev/null

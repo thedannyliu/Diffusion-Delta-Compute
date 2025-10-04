@@ -42,6 +42,8 @@ BUDGET_FRACTION=${BUDGET_FRACTION:-}
 LAYER_M=${LAYER_M:-}
 
 echo "[sbatch] P2 rule gate sweep using config=${CONFIG_PATH} engine=${ENGINE}"
-PROFILES=${PROFILES:-"conservative balanced aggressive"}
-EXPORT_VARS=ALL,ENGINE=${ENGINE},OUT_DIR=${OUT_DIR},TASKS_CFG=${TASKS_CFG},PATHS_CFG=${PATHS_CFG},THRESHOLDS_CFG=${THRESHOLDS_CFG},PROFILE=${PROFILE},DATASET_KEY=${DATASET_KEY},RISK_DELTA=${RISK_DELTA},BUDGET_FRACTION=${BUDGET_FRACTION},LAYER_M=${LAYER_M},PROFILES="${PROFILES}"
+# Define profiles in the job environment, and pass the NAME (not assignment) via --export
+export PROFILES_CSV=${PROFILES_CSV:-"conservative,balanced,aggressive"}
+# Note: commas in values break srun --export assignments; pass variable name only
+EXPORT_VARS=ALL,ENGINE=${ENGINE},OUT_DIR=${OUT_DIR},TASKS_CFG=${TASKS_CFG},PATHS_CFG=${PATHS_CFG},THRESHOLDS_CFG=${THRESHOLDS_CFG},PROFILE=${PROFILE},DATASET_KEY=${DATASET_KEY},RISK_DELTA=${RISK_DELTA},BUDGET_FRACTION=${BUDGET_FRACTION},LAYER_M=${LAYER_M},PROFILES_CSV
 srun --export=${EXPORT_VARS} bash scripts/run_p2_rule_gate.sh "$CONFIG_PATH" "$@"
