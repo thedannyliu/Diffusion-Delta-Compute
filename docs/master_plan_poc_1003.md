@@ -318,6 +318,7 @@ The repository now includes wrappers that launch Wikitext-2, LAMBADA-open, and T
 - scripts/sbatch_p3_smoke_all.sbatch
 - scripts/sbatch_p4_smoke_all.sbatch
 - scripts/sbatch_p5_smoke_all.sbatch
+- scripts/sbatch_p1_smoke_quick.sbatch  # 3-sample sanity run to validate cluster setup
 
 Usage examples
 - sbatch scripts/sbatch_p1_smoke_all.sbatch

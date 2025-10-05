@@ -64,7 +64,11 @@ def load_lambada_openai(n_eval: int = 500, data_root: Optional[str] = None) -> E
                         break
             return EvalBatch(texts=texts, labels=labels)
 
-    ds = load_dataset("lambada", "en", split="validation")
+    # Public HF dataset exposes only the "plain_text" config; keep backward compat
+    try:
+        ds = load_dataset("lambada", "en", split="validation")
+    except ValueError:
+        ds = load_dataset("lambada", "plain_text", split="validation")
     texts: List[str] = []
     labels: List[str] = []
     for ex in ds:
@@ -119,5 +123,4 @@ def load_gsm8k_tiny(n_eval: int = 500, data_root: Optional[str] = None) -> EvalB
         if len(texts) >= n_eval:
             break
     return EvalBatch(texts=texts, labels=labels)
-
 

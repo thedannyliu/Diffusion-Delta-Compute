@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -154,3 +154,5 @@ class D2FDreamEngine(BaseEngine):
     def num_steps(self) -> int:
         return self._num_steps
 
+    def decode_tokens(self, token_ids: Sequence[int]) -> str:
+        return self._tokenizer.decode(token_ids, skip_special_tokens=True)
