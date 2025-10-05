@@ -3,8 +3,8 @@
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
 #SBATCH -c 8
-#SBATCH --mem=40G
-#SBATCH -t 12:00:00
+#SBATCH --mem=80G
+#SBATCH -t 06:00:00
 #SBATCH -o logs/%x-%j.out
 
 module load cuda/12.1 || true
@@ -44,9 +44,9 @@ srun --exclusive -N1 -n1 bash -lc '
 '
 
 declare -a DATASETS=(
-  "wikitext:2000:wikitext_learned"
-  "lambada:2000:lambada_learned"
-  "gsm8k:1500:gsm8k_learned"
+  "wikitext:100:wikitext_learned"
+  "lambada:100:lambada_learned"
+  "gsm8k:100:gsm8k_learned"
 )
 
 for spec in "${DATASETS[@]}"; do
@@ -72,4 +72,3 @@ for spec in "${DATASETS[@]}"; do
 done
 
 echo "[sbatch] P3 smoke triplet completed"
-

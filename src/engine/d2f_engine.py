@@ -156,3 +156,39 @@ class D2FDreamEngine(BaseEngine):
 
     def decode_tokens(self, token_ids: Sequence[int]) -> str:
         return self._tokenizer.decode(token_ids, skip_special_tokens=True)
+
+    def greedy_generate(self, prompt: str, max_new_tokens: int = 16) -> List[int]:
+        # Encode prompt ids
+        inputs = self._tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self._seq_len)
+        input_ids = inputs["input_ids"].to(self._device)
+        attn_mask = inputs.get("attention_mask", None)
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(self._device).to(torch.bool)
+
+        gen_ids: List[int] = []
+        get_oe = getattr(self._model, "get_output_embeddings", None)
+        if not callable(get_oe) or get_oe() is None:
+            return gen_ids  # no LM head available
+        lm_head = get_oe()
+
+        for _ in range(int(max_new_tokens)):
+            with torch.no_grad():
+                out = self._model(input_ids=input_ids, attention_mask=attn_mask, output_hidden_states=True)
+                last_hidden = out.hidden_states[-1][:, -1, :]  # [1, hidden]
+                # match dtype to head
+                weight = getattr(lm_head, "weight", None)
+                if weight is not None:
+                    last_hidden = last_hidden.to(dtype=weight.dtype)
+                logits = lm_head(last_hidden)  # [1, vocab]
+                next_id = int(torch.argmax(logits[0]).item())
+            gen_ids.append(next_id)
+            # append token
+            next_token = torch.tensor([[next_id]], device=input_ids.device)
+            input_ids = torch.cat([input_ids, next_token], dim=1)
+            if attn_mask is not None:
+                attn_mask = torch.cat([attn_mask, torch.ones_like(next_token, dtype=torch.bool)], dim=1)
+            # early stop on EOS
+            eos_id = getattr(self._tokenizer, "eos_token_id", None)
+            if eos_id is not None and next_id == int(eos_id):
+                break
+        return gen_ids

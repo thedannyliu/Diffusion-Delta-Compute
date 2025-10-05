@@ -85,3 +85,7 @@ class MockDiffusionEngine(BaseEngine):
 
     def decode_tokens(self, token_ids: Sequence[int]) -> str:
         return " ".join(f"<tok{tid}>" for tid in token_ids)
+
+    def greedy_generate(self, prompt: str, max_new_tokens: int = 16) -> List[int]:
+        # Deterministic pseudo-generation: return ascending token ids capped by vocab
+        return [min(self.vocab_size - 1, i % self.vocab_size) for i in range(max_new_tokens)]

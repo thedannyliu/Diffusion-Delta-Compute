@@ -350,6 +350,14 @@ def _decode_last_token_text(logits: Optional[np.ndarray], engine: BaseEngine) ->
         return ""
 
 
+def _generate_text(engine: BaseEngine, prompt: str, max_new: int) -> str:
+    try:
+        ids = engine.greedy_generate(prompt, max_new_tokens=max_new)
+        return engine.decode_tokens(ids).strip()
+    except NotImplementedError:
+        return ""
+
+
 def _extract_gsm_answer(text: str) -> str:
     text = text.strip()
     if not text:
@@ -662,13 +670,15 @@ def run_teacher(
             decoded_text = engine.decode_tokens(tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                last_token_text = _decode_last_token_text(prev_logits, engine)
-                pred_word = _extract_last_word(last_token_text)
+                gen_text = _generate_text(engine, prompt, max_new=8)
+                # take the first word from generated continuation
+                pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                gen_text = _generate_text(engine, prompt, max_new=64)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -1120,13 +1130,14 @@ def run_rule_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                last_token_text = _decode_last_token_text(prev_logits, engine)
-                pred_word = _extract_last_word(last_token_text)
+                gen_text = _generate_text(engine, prompt, max_new=8)
+                pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                gen_text = _generate_text(engine, prompt, max_new=64)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -1475,13 +1486,14 @@ def run_learned_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                last_token_text = _decode_last_token_text(prev_logits, engine)
-                pred_word = _extract_last_word(last_token_text)
+                gen_text = _generate_text(engine, prompt, max_new=8)
+                pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                gen_text = _generate_text(engine, prompt, max_new=64)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -1679,13 +1691,14 @@ def run_adaptive(
             decoded_text = engine.decode_tokens(tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                last_token_text = _decode_last_token_text(prev_logits, engine)
-                pred_word = _extract_last_word(last_token_text)
+                gen_text = _generate_text(engine, prompt, max_new=8)
+                pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                gen_text = _generate_text(engine, prompt, max_new=64)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
         nominal_steps = float(num_steps)

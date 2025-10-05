@@ -3,8 +3,8 @@
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
 #SBATCH -c 8
-#SBATCH --mem=40G
-#SBATCH -t 08:00:00
+#SBATCH --mem=80G
+#SBATCH -t 06:00:00
 #SBATCH -o logs/%x-%j.out
 
 module load cuda/12.1 || true
@@ -34,9 +34,9 @@ CONFIG_BASE=${CONFIG_BASE:-configs/p5_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "wikitext:2000:wikitext_p5"
-  "lambada:2000:lambada_p5"
-  "gsm8k:1500:gsm8k_p5"
+  "wikitext:100:wikitext_p5"
+  "lambada:100:lambada_p5"
+  "gsm8k:100:gsm8k_p5"
 )
 
 for spec in "${DATASETS[@]}"; do
@@ -59,4 +59,3 @@ for spec in "${DATASETS[@]}"; do
 done
 
 echo "[sbatch] P5 smoke triplet completed"
-

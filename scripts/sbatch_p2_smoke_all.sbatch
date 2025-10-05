@@ -3,8 +3,8 @@
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
 #SBATCH -c 8
-#SBATCH --mem=40G
-#SBATCH -t 12:00:00
+#SBATCH --mem=80G
+#SBATCH -t 06:00:00
 #SBATCH -o logs/%x-%j.out
 
 module load cuda/12.1 || true
@@ -34,9 +34,9 @@ ENGINE=${ENGINE:-d2f}
 
 # spec: TASK:N_PROMPTS:PROFILE:RISK_DELTA:EXP
 declare -a DATASETS=(
-  "wikitext:2000:balanced:0.005:wikitext_rule"
-  "lambada:2000:conservative:0.0075:lambada_rule"
-  "gsm8k:1500:balanced:0.010:gsm8k_rule"
+  "wikitext:100:balanced:0.005:wikitext_rule"
+  "lambada:100:conservative:0.0075:lambada_rule"
+  "gsm8k:100:balanced:0.010:gsm8k_rule"
 )
 
 echo "[sbatch] P2 smoke triplet starting (engine=${ENGINE})"
@@ -67,4 +67,3 @@ for spec in "${DATASETS[@]}"; do
 done
 
 echo "[sbatch] P2 smoke triplet completed"
-

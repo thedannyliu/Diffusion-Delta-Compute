@@ -3,7 +3,7 @@
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
 #SBATCH --mem=80G
-#SBATCH -t 12:00:00
+#SBATCH -t 4:00:00
 #SBATCH -o logs/%x-%j.out
 
 module load cuda/12.1 || true
