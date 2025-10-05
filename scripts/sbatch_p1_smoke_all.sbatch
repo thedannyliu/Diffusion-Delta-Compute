@@ -2,7 +2,7 @@
 #SBATCH -J dcllm_p1_smoke_all
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
-#SBATCH --mem=40G
+#SBATCH --mem=80G
 #SBATCH -t 12:00:00
 #SBATCH -o logs/%x-%j.out
 
@@ -32,9 +32,9 @@ CONFIG_PATH=${CONFIG_PATH:-configs/p1_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "wikitext:2000:wikitext_smoke"
-  "lambada:2000:lambada_smoke"
-  "gsm8k:1500:gsm8k_smoke"
+  "wikitext:100:wikitext_smoke"
+  "lambada:100:lambada_smoke"
+  "gsm8k:100:gsm8k_smoke"
 )
 
 echo "[sbatch] P1 smoke triplet starting (engine=${ENGINE})"
@@ -63,4 +63,3 @@ for spec in "${DATASETS[@]}"; do
 done
 
 echo "[sbatch] P1 smoke triplet completed"
-

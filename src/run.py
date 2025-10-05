@@ -153,6 +153,26 @@ def synthetic_prompts(num_prompts: int) -> List[str]:
     return prompts
 
 
+GSM8K_FEWSHOT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
+    ("Tom has 6 marbles. He buys 5 packs with 4 marbles each. How many marbles does he have now?", "26"),
+    ("A bakery sells 8 muffins each morning and bakes 3 more batches of 5 muffins. How many muffins are for sale?", "23"),
+    ("Sara reads 12 pages each day for 4 days and then 8 more pages. How many pages did she read?", "56"),
+    ("Mike had 45 stickers, gave 18 to his friend, then bought 9 more. How many stickers does he have?", "36"),
+    ("A class has 24 students. If 7 new students join and 5 leave, how many students remain?", "26"),
+    ("Jenny buys 3 notebooks at $4 each and a pen that costs $5. How much does she spend?", "17"),
+    ("There are 120 seats in a hall. If 4 rows of 8 seats are reserved, how many seats are left?", "88"),
+    ("A farmer collected 56 eggs on Monday and 47 eggs on Tuesday. If he sells 50 eggs, how many eggs remain?", "53"),
+)
+
+
+def format_gsm8k_prompt(question: str) -> str:
+    shots = []
+    for ex_q, ex_a in GSM8K_FEWSHOT_EXAMPLES:
+        shots.append(f"Q: {ex_q}\nA: {ex_a}")
+    shots_text = "\n\n".join(shots)
+    return f"{shots_text}\n\nQ: {question}\nA:"
+
+
 def load_prompts(num_prompts: int, task: str, data_root: Optional[str]) -> Tuple[List[str], Optional[List[str]]]:
     if task == "synthetic":
         return synthetic_prompts(num_prompts), None
@@ -163,7 +183,8 @@ def load_prompts(num_prompts: int, task: str, data_root: Optional[str]) -> Tuple
         return batch.texts, batch.labels
     if task == "gsm8k":
         batch = load_gsm8k_tiny(n_eval=num_prompts, data_root=data_root)
-        return batch.texts, batch.labels
+        formatted = [format_gsm8k_prompt(q) for q in batch.texts]
+        return formatted, batch.labels
     raise ValueError(f"Unsupported task: {task}")
 
 
@@ -276,22 +297,35 @@ def _accumulate_ppl(stats: Dict[str, float], logits: np.ndarray, input_ids: Sequ
     ids = np.asarray(input_ids, dtype=np.int64)
     if ids.ndim == 0:
         ids = ids.reshape(1)
-    mask = np.ones_like(ids, dtype=bool)
+    if logits.shape[0] <= 1 or ids.shape[0] <= 1:
+        return
+
+    ids_next = ids[1:]
+    logits_used = logits[:-1]
+    mask = np.ones_like(ids_next, dtype=bool)
+
     if pad_token_id is not None and pad_token_id != -1:
-        mask &= ids != int(pad_token_id)
+        mask &= ids_next != int(pad_token_id)
     if special_mask is not None:
         spec = np.asarray(special_mask, dtype=bool)
         if spec.shape == ids.shape:
-            mask &= ~spec
-    if not np.any(mask):
+            mask &= ~spec[1:]
+
+    valid_positions = np.nonzero(mask)[0]
+    if valid_positions.size == 0:
         return
-    logits = logits.astype(np.float64)
-    logits = logits - np.max(logits, axis=-1, keepdims=True)
-    log_probs = logits - np.log(np.sum(np.exp(logits), axis=-1, keepdims=True))
-    token_nll = -log_probs[np.arange(ids.shape[0]), ids]
-    selected = token_nll[mask]
-    stats["nll_sum"] = stats.get("nll_sum", 0.0) + float(np.sum(selected))
-    stats["token_count"] = stats.get("token_count", 0.0) + float(selected.shape[0])
+
+    target_ids = ids_next[valid_positions].astype(np.int64)
+    logits_valid = logits_used[valid_positions].astype(np.float64)
+    if logits_valid.ndim != 2 or logits_valid.shape[0] == 0:
+        return
+
+    logits_centered = logits_valid - np.max(logits_valid, axis=-1, keepdims=True)
+    log_probs = logits_centered - np.log(np.sum(np.exp(logits_centered), axis=-1, keepdims=True))
+    token_nll = -log_probs[np.arange(target_ids.shape[0]), target_ids]
+
+    stats["nll_sum"] = stats.get("nll_sum", 0.0) + float(np.sum(token_nll))
+    stats["token_count"] = stats.get("token_count", 0.0) + float(token_nll.shape[0])
 
 
 def _normalize_word(word: str) -> str:
@@ -301,6 +335,19 @@ def _normalize_word(word: str) -> str:
 def _extract_last_word(text: str) -> str:
     tokens = text.strip().split()
     return tokens[-1] if tokens else ""
+
+
+def _decode_last_token_text(logits: Optional[np.ndarray], engine: BaseEngine) -> str:
+    if logits is None or logits.ndim == 0 or logits.shape[0] == 0:
+        return ""
+    last_row = logits[-1]
+    if last_row.ndim == 0 or last_row.size == 0:
+        return ""
+    token_id = int(np.argmax(last_row))
+    try:
+        return engine.decode_tokens([token_id]).strip()
+    except NotImplementedError:
+        return ""
 
 
 def _extract_gsm_answer(text: str) -> str:
@@ -615,7 +662,8 @@ def run_teacher(
             decoded_text = engine.decode_tokens(tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                pred_word = _extract_last_word(decoded_text)
+                last_token_text = _decode_last_token_text(prev_logits, engine)
+                pred_word = _extract_last_word(last_token_text)
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
@@ -1072,7 +1120,8 @@ def run_rule_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                pred_word = _extract_last_word(decoded_text)
+                last_token_text = _decode_last_token_text(prev_logits, engine)
+                pred_word = _extract_last_word(last_token_text)
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
@@ -1426,7 +1475,8 @@ def run_learned_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                pred_word = _extract_last_word(decoded_text)
+                last_token_text = _decode_last_token_text(prev_logits, engine)
+                pred_word = _extract_last_word(last_token_text)
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
@@ -1629,7 +1679,8 @@ def run_adaptive(
             decoded_text = engine.decode_tokens(tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                pred_word = _extract_last_word(decoded_text)
+                last_token_text = _decode_last_token_text(prev_logits, engine)
+                pred_word = _extract_last_word(last_token_text)
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
