@@ -1,5 +1,6 @@
 phase: P5
 engine: mock
-num_prompts: 8
+num_prompts: 16
+max_new_tokens: 128
 num_steps: 12
 task: synthetic

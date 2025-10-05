@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -83,4 +83,5 @@ class MockDiffusionEngine(BaseEngine):
     def num_steps(self) -> int:
         return self._num_steps
 
-
+    def decode_tokens(self, token_ids: Sequence[int]) -> str:
+        return " ".join(f"<tok{tid}>" for tid in token_ids)

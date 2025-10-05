@@ -1,16 +1,18 @@
 import argparse
 import json
 import os
+import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from src.utils.logging import init_run_logging
 from src.utils.timer import Timer
+from src.utils.decision_logger import DecisionLogger, close_loggers
 from src.engine.base_engine import BaseEngine
 from src.engine.mock_engine import MockDiffusionEngine
 
@@ -26,12 +28,24 @@ from src.probes.metrics import (
 )
 from src.gating.rule_gate import RuleGate, RuleGateConfig, StepGateResult
 from src.gating.learned_gate import LearnedGate, LearnedGateConfig, LearnedGateWeights
-from src.gating.conformal import ConformalRiskCalibrator, compute_risk_score
+from src.gating.conformal import (
+    ConformalRiskCalibrator,
+    StepwiseConformalCalibrator,
+    compute_risk_score,
+)
 from src.gating.budget import BudgetController
 from src.gating.adaptive import AdaptiveScheduler, AdaptiveSchedulerConfig
 from src.gating.rollback import RollbackBuffer
 from src.eval.tasks import load_wikitext2, load_lambada_openai, load_gsm8k_tiny
 from src.utils.profile import query_gpu_utilization, GPUUtilSampler
+from src.utils.quantiles import (
+    DEFAULT_QUANTILES,
+    StepQuantileTable,
+    apply_ema,
+    clip_sequence,
+    compute_step_metric_quantiles,
+    dump_step_quantiles,
+)
 from src.utils.config import load_yaml, ensure_output_dirs, save_manifest
 
 try:  # Optional dependency; scripts can run without W&B
@@ -85,6 +99,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--watchdog_min_cos", type=float, default=None)
     parser.add_argument("--watchdog_max_kl", type=float, default=None)
     parser.add_argument("--layer_recompute_M", type=int, default=None)
+    parser.add_argument("--gamma_margin", type=float, default=None, help="Margin threshold override for gating decisions")
+    parser.add_argument("--quantiles_path", type=str, default=None, help="Path to teacher stepwise quantiles JSON")
+    parser.add_argument("--one_minus_cos_quantile", type=float, default=None, help="Quantile level (0-1) used to derive per-step cosine thresholds")
+    parser.add_argument("--delta_l2_quantile", type=float, default=None, help="Quantile level (0-1) used to derive per-step ΔL2 thresholds")
+    parser.add_argument("--kl_quantile", type=float, default=None, help="Quantile level (0-1) used to derive per-step KL guard thresholds")
+    parser.add_argument("--stepwise_ema", type=float, default=None, help="EMA smoothing factor (0-1, high=more smoothing) for stepwise thresholds")
+    parser.add_argument("--stepwise_clip", type=str, default=None, help="Comma-separated min,max bounds applied to raw stepwise thresholds")
+    parser.add_argument("--risk_quantiles_path", type=str, default=None, help="Path to precomputed per-step risk thresholds for conformal calibration")
+    parser.add_argument("--risk_initial_quantile", type=float, default=None, help="Fallback quantile used before enough unsafe samples exist")
+    parser.add_argument("--risk_low_support", type=int, default=None, help="Minimum unsafe sample count per step before using per-step threshold")
+    parser.add_argument("--risk_window", type=int, default=None, help="Sliding window size for stepwise conformal calibrator")
     parser.add_argument("--consistency_full_compute", action="store_true", help="Run full-compute baseline and compare outputs; write difference report")
     parser.add_argument("--risk_delta", type=float, default=0.01, help="Target conformal δ bound")
     parser.add_argument("--budget_fraction", type=float, default=1.0, help="Per-step compute budget as fraction of Teacher FLOPs")
@@ -128,17 +153,17 @@ def synthetic_prompts(num_prompts: int) -> List[str]:
     return prompts
 
 
-def load_prompts(num_prompts: int, task: str, data_root: Optional[str]) -> List[str]:
+def load_prompts(num_prompts: int, task: str, data_root: Optional[str]) -> Tuple[List[str], Optional[List[str]]]:
     if task == "synthetic":
-        return synthetic_prompts(num_prompts)
+        return synthetic_prompts(num_prompts), None
     if task == "wikitext":
-        return load_wikitext2(n_eval=num_prompts, data_root=data_root)
+        return load_wikitext2(n_eval=num_prompts, data_root=data_root), None
     if task == "lambada":
         batch = load_lambada_openai(n_eval=num_prompts, data_root=data_root)
-        return batch.texts
+        return batch.texts, batch.labels
     if task == "gsm8k":
         batch = load_gsm8k_tiny(n_eval=num_prompts, data_root=data_root)
-        return batch.texts
+        return batch.texts, batch.labels
     raise ValueError(f"Unsupported task: {task}")
 
 
@@ -168,6 +193,131 @@ FEATURE_NAMES = (
     "delta_l2_norm",
     "risk_score",
 )
+
+
+_SLUG_RE = re.compile(r"[^a-zA-Z0-9_-]+")
+
+
+def slugify(value: Optional[str], fallback: str = "run") -> str:
+    if not value:
+        return fallback
+    candidate = str(value).strip().replace(" ", "_")
+    candidate = _SLUG_RE.sub("-", candidate)
+    candidate = candidate.strip("-_")
+    return candidate or fallback
+
+
+def parse_clip_config(value: Optional[object]) -> Tuple[Optional[float], Optional[float]]:
+    if value is None:
+        return (None, None)
+    if isinstance(value, str):
+        parts = [part for part in value.split(",") if part]
+    elif isinstance(value, (list, tuple)):
+        parts = [str(part) for part in value]
+    else:
+        raise ValueError("stepwise_clip must be a comma-separated string or length-2 sequence")
+    if not parts:
+        return (None, None)
+    if len(parts) == 1:
+        lo = float(parts[0])
+        return (lo, None)
+    lo = float(parts[0]) if parts[0] else None
+    hi = float(parts[1]) if parts[1] else None
+    return (lo, hi)
+
+
+@dataclass
+class TeacherArtifacts:
+    features_path: Optional[str] = None
+    quantiles_path: Optional[str] = None
+    outputs_path: Optional[str] = None
+
+
+@dataclass
+class StepwiseThresholds:
+    cosine_tau: List[float]
+    delta_l2_rho: List[float]
+    gamma_margin: Optional[List[float]] = None
+    source_path: Optional[str] = None
+
+    def cosine_for_step(self, step: int) -> Optional[float]:
+        if 0 <= step < len(self.cosine_tau):
+            return float(self.cosine_tau[step])
+        return None
+
+    def delta_for_step(self, step: int) -> Optional[float]:
+        if 0 <= step < len(self.delta_l2_rho):
+            return float(self.delta_l2_rho[step])
+        return None
+
+    def margin_for_step(self, step: int) -> Optional[float]:
+        if self.gamma_margin is None:
+            return None
+        if 0 <= step < len(self.gamma_margin):
+            return float(self.gamma_margin[step])
+        return None
+
+
+def logits_argmax_and_margin(logits: np.ndarray) -> Tuple[List[int], List[float]]:
+    top_indices = np.argmax(logits, axis=-1)
+    sorted_logits = np.sort(logits, axis=-1)
+    top1_vals = sorted_logits[:, -1]
+    if logits.shape[1] > 1:
+        top2_vals = sorted_logits[:, -2]
+    else:
+        top2_vals = np.zeros_like(top1_vals)
+    margins = top1_vals - top2_vals
+    return top_indices.astype(np.int64).tolist(), margins.astype(np.float32).tolist()
+
+
+def _accumulate_ppl(stats: Dict[str, float], logits: np.ndarray, input_ids: Sequence[int], pad_token_id: int, special_mask: Optional[Sequence[int]]) -> None:
+    if logits is None or input_ids is None:
+        return
+    ids = np.asarray(input_ids, dtype=np.int64)
+    if ids.ndim == 0:
+        ids = ids.reshape(1)
+    mask = np.ones_like(ids, dtype=bool)
+    if pad_token_id is not None and pad_token_id != -1:
+        mask &= ids != int(pad_token_id)
+    if special_mask is not None:
+        spec = np.asarray(special_mask, dtype=bool)
+        if spec.shape == ids.shape:
+            mask &= ~spec
+    if not np.any(mask):
+        return
+    logits = logits.astype(np.float64)
+    logits = logits - np.max(logits, axis=-1, keepdims=True)
+    log_probs = logits - np.log(np.sum(np.exp(logits), axis=-1, keepdims=True))
+    token_nll = -log_probs[np.arange(ids.shape[0]), ids]
+    selected = token_nll[mask]
+    stats["nll_sum"] = stats.get("nll_sum", 0.0) + float(np.sum(selected))
+    stats["token_count"] = stats.get("token_count", 0.0) + float(selected.shape[0])
+
+
+def _normalize_word(word: str) -> str:
+    return word.strip().strip("\"'`.,;:!?()[]{}<>-_\u201c\u201d\u2018\u2019").lower()
+
+
+def _extract_last_word(text: str) -> str:
+    tokens = text.strip().split()
+    return tokens[-1] if tokens else ""
+
+
+def _extract_gsm_answer(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return ""
+    if "####" in text:
+        return text.split("####")[-1].strip()
+    matches = re.findall(r"-?\d[\d,\.]*", text)
+    if matches:
+        return matches[-1]
+    tokens = text.split()
+    return tokens[-1] if tokens else text
+
+
+def _normalize_gsm_answer(ans: str) -> str:
+    return ans.strip().replace(",", "").replace(" ", "").lower()
 
 
 @dataclass
@@ -243,7 +393,12 @@ def run_teacher(
     dump_features_dir: Optional[str] = None,
     label_thresholds: Optional[Dict[str, float]] = None,
     oracle_eval: bool = False,
-) -> Optional[str]:
+    *,
+    task_name: Optional[str] = None,
+    exp_name: Optional[str] = None,
+    quantile_levels: Sequence[float] = DEFAULT_QUANTILES,
+    labels: Optional[List[str]] = None,
+) -> TeacherArtifacts:
     from src.viz.plots import save_heatmap, save_hist
 
     aggregates: List[Dict] = []
@@ -275,6 +430,25 @@ def run_teacher(
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     layer_step_mse: Dict[Tuple[int, int], List[float]] = defaultdict(list)
 
+    metric_samples = {
+        "one_minus_cos": defaultdict(list),
+        "delta_l2_norm": defaultdict(list),
+        "kl": defaultdict(list),
+    }
+    step_token_counts: Dict[int, int] = defaultdict(int)
+    features_path: Optional[str] = None
+    teacher_outputs_path = os.path.join(out_dirs["runs"], f"teacher_outputs_{timestamp}.jsonl")
+    teacher_outputs_file = open(teacher_outputs_path, "w", encoding="utf-8")
+
+    is_wikitext = task_name == "wikitext"
+    is_lambada = task_name == "lambada"
+    is_gsm8k = task_name == "gsm8k"
+    ppl_stats: Dict[str, float] = {"nll_sum": 0.0, "token_count": 0.0}
+    lambada_correct = 0
+    lambada_total = len(labels) if is_lambada and labels is not None else 0
+    gsm_correct = 0
+    gsm_total = len(labels) if is_gsm8k and labels is not None else 0
+
     for prompt_idx, prompt in enumerate(prompts):
         state = engine.encode_prompt(prompt)
         prev_hidden: Optional[List[np.ndarray]] = None
@@ -293,8 +467,15 @@ def run_teacher(
         layer_step_values_dl2: Dict[Tuple[int, int], np.ndarray] = {}
 
         seq_start = time.time()
+        final_aux: Optional[Dict] = None
         for t in range(num_steps):
             out = engine.step(state, t)
+            # Immediate GPU sample after a GPU-heavy op to avoid missing short spikes
+            try:
+                sampler.sample_once()
+            except Exception:
+                pass
+            final_aux = out.aux if isinstance(out.aux, dict) else None
             if prev_hidden is not None and prev_logits is not None:
                 # Build valid mask (exclude padding and special tokens)
                 valid_mask: Optional[np.ndarray] = None
@@ -335,6 +516,10 @@ def run_teacher(
                 cos_hist_samples.extend(cos.flatten().tolist())
                 dl2_hist_samples.extend(dl2.flatten().tolist())
                 dl2_norm_hist_samples.extend(dl2_norm.flatten().tolist())
+                metric_samples["one_minus_cos"][t].append(1.0 - cos)
+                metric_samples["delta_l2_norm"][t].append(dl2_norm)
+                metric_samples["kl"][t].append(kl)
+                step_token_counts[t] += int(cos.shape[0])
                 if stability_counter is None or stability_counter.shape[0] != labels.shape[0]:
                     stability_counter = np.zeros_like(labels, dtype=np.int32)
                     stability_max = np.zeros_like(labels, dtype=np.int32)
@@ -416,6 +601,37 @@ def run_teacher(
         if stability_max is not None:
             stability_lengths.extend(int(x) for x in stability_max.tolist())
         per_seq_latency_ms.append((time.time() - seq_start) * 1000.0)
+
+        if prev_logits is not None:
+            if is_wikitext and final_aux is not None:
+                input_ids = final_aux.get("input_ids") if isinstance(final_aux, dict) else None
+                special_mask = final_aux.get("special_tokens_mask") if isinstance(final_aux, dict) else None
+                pad_token_id = int(final_aux.get("pad_token_id", -1)) if isinstance(final_aux, dict) else -1
+                if input_ids is not None:
+                    _accumulate_ppl(ppl_stats, prev_logits, input_ids, pad_token_id, special_mask)
+
+            tokens, margins = logits_argmax_and_margin(prev_logits)
+            checksum = float(np.sum(prev_logits)) if prev_logits.size else 0.0
+            decoded_text = engine.decode_tokens(tokens).strip()
+            if is_lambada and labels is not None and prompt_idx < len(labels):
+                gold_word = labels[prompt_idx]
+                pred_word = _extract_last_word(decoded_text)
+                if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
+                    lambada_correct += 1
+            if is_gsm8k and labels is not None and prompt_idx < len(labels):
+                gold_ans = labels[prompt_idx]
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                if pred_ans == _normalize_gsm_answer(str(gold_ans)):
+                    gsm_correct += 1
+
+            record = {
+                "prompt_id": int(prompt_idx),
+                "prompt": prompt,
+                "tokens": tokens,
+                "margins": margins,
+                "logits_checksum": checksum,
+            }
+            teacher_outputs_file.write(json.dumps(record) + "\n")
 
     layer_mse_curves: Dict[int, List[float]] = {}
     mse_steps: List[int] = list(range(1, num_steps)) if num_steps > 1 else []
@@ -503,23 +719,6 @@ def run_teacher(
     if len(dl2_norm_hist_samples) > 0:
         save_hist(np.array(dl2_norm_hist_samples), os.path.join(out_dirs["figures"], f"teacher_dl2norm_hist_{timestamp}.png"), title="ΔL2 normalized histogram")
 
-    total_time_s = max(1e-6, time.time() - total_start)
-    sampler.stop()
-    gpu = sampler.metrics or (query_gpu_utilization() or {})
-    summary = {
-        "mode": "teacher",
-        "num_prompts": len(prompts),
-        "num_steps": num_steps,
-        "latency_ms_mean": float(np.mean(per_seq_latency_ms) if per_seq_latency_ms else 0.0),
-        "latency_ms_p50": float(np.percentile(per_seq_latency_ms, 50) if per_seq_latency_ms else 0.0),
-        "latency_ms_p90": float(np.percentile(per_seq_latency_ms, 90) if per_seq_latency_ms else 0.0),
-        "throughput_seq_per_s": float(len(prompts) / total_time_s),
-        "oracle_skip_ratio_mean": float(np.mean(oracle_ratios) if oracle_ratios else -1.0),
-        **{f"gpu_{k}": v for k, v in gpu.items()},
-    }
-    with open(os.path.join(out_dirs["runs"], f"teacher_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
     try:
         from src.viz.rich import render_teacher_suite
 
@@ -543,6 +742,10 @@ def run_teacher(
     except Exception:
         pass
 
+    total_time_s = max(1e-6, time.time() - total_start)
+    sampler.stop()
+    gpu = sampler.metrics or (query_gpu_utilization() or {})
+
     if dump_features_dir and feature_blocks:
         os.makedirs(dump_features_dir, exist_ok=True)
         features = np.concatenate(feature_blocks, axis=0)
@@ -557,9 +760,81 @@ def run_teacher(
             feature_names=np.array(FEATURE_NAMES),
             label_thresholds=np.array([cos_tau, dl2_rho, kl_max], dtype=np.float32),
         )
-        return out_path
+        features_path = out_path
 
-    return None
+    quantiles_by_metric: Dict[str, Dict[int, Dict[str, float]]] = {}
+    for metric_name, samples in metric_samples.items():
+        quantiles_by_metric[metric_name] = compute_step_metric_quantiles(samples, quantile_levels)
+
+    token_counts = {str(step): int(count) for step, count in step_token_counts.items()}
+    dataset_slug = slugify(task_name, "dataset")
+    exp_slug = slugify(exp_name, dataset_slug)
+    quantile_filename = "_".join([
+        "teacher_quantiles",
+        dataset_slug,
+        exp_slug,
+        timestamp,
+    ]) + ".json"
+    quantiles_path = os.path.join(out_dirs["runs"], quantile_filename)
+    dump_step_quantiles(
+        quantiles_path,
+        quantiles_by_metric,
+        metadata={
+            "task": task_name,
+            "exp_name": exp_name,
+            "num_steps": num_steps,
+            "quantiles": list(float(q) for q in quantile_levels),
+            "token_counts": token_counts,
+            "timestamp": timestamp,
+        },
+    )
+
+    quality_metrics: Dict[str, Dict[str, float]] = {}
+    if is_wikitext and ppl_stats["token_count"] > 0:
+        ppl_value = float(np.exp(ppl_stats["nll_sum"] / ppl_stats["token_count"]))
+        quality_metrics["perplexity"] = {
+            "value": ppl_value,
+            "token_count": int(ppl_stats["token_count"]),
+            "nll_sum": float(ppl_stats["nll_sum"]),
+        }
+    if is_lambada and lambada_total:
+        quality_metrics["accuracy"] = {
+            "value": float(lambada_correct / lambada_total if lambada_total else 0.0),
+            "correct": int(lambada_correct),
+            "total": int(lambada_total),
+        }
+    if is_gsm8k and gsm_total:
+        quality_metrics["exact_match"] = {
+            "value": float(gsm_correct / gsm_total if gsm_total else 0.0),
+            "correct": int(gsm_correct),
+            "total": int(gsm_total),
+        }
+
+    summary = {
+        "mode": "teacher",
+        "num_prompts": len(prompts),
+        "num_steps": num_steps,
+        "latency_ms_mean": float(np.mean(per_seq_latency_ms) if per_seq_latency_ms else 0.0),
+        "latency_ms_p50": float(np.percentile(per_seq_latency_ms, 50) if per_seq_latency_ms else 0.0),
+        "latency_ms_p90": float(np.percentile(per_seq_latency_ms, 90) if per_seq_latency_ms else 0.0),
+        "throughput_seq_per_s": float(len(prompts) / total_time_s),
+        "oracle_skip_ratio_mean": float(np.mean(oracle_ratios) if oracle_ratios else -1.0),
+        "quantiles_path": quantiles_path,
+        "features_path": features_path,
+        "final_outputs_path": teacher_outputs_path,
+        "task": task_name,
+        "exp_name": exp_name,
+        **{f"gpu_{k}": v for k, v in gpu.items()},
+    }
+    if quality_metrics:
+        summary["quality"] = quality_metrics
+    summary_path = os.path.join(out_dirs["runs"], f"teacher_summary_{timestamp}.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    teacher_outputs_file.close()
+
+    return TeacherArtifacts(features_path=features_path, quantiles_path=quantiles_path, outputs_path=teacher_outputs_path)
 
 
 def run_rule_gate(
@@ -571,6 +846,12 @@ def run_rule_gate(
     risk_delta: float,
     budget_fraction: float,
     consistency_check: bool = False,
+    stepwise_thresholds: Optional[StepwiseThresholds] = None,
+    calibrator_cfg: Optional[Dict[str, object]] = None,
+    decision_logger: Optional[DecisionLogger] = None,
+    profile: Optional[str] = None,
+    labels: Optional[List[str]] = None,
+    task_name: Optional[str] = None,
 ) -> None:
     from src.viz.plots import save_hist
 
@@ -579,7 +860,18 @@ def run_rule_gate(
     freeze_ratios_by_step: Dict[int, List[float]] = defaultdict(list)
 
     gate = RuleGate(cfg)
-    calibrator = ConformalRiskCalibrator(delta=risk_delta, initial_quantile=0.60)
+    calibrator_params = calibrator_cfg or {}
+    calibrator = StepwiseConformalCalibrator(
+        delta=risk_delta,
+        num_steps=num_steps,
+        initial_quantile=float(calibrator_params.get("initial_quantile", 0.60)),
+        ema_alpha=calibrator_params.get("ema_alpha"),
+        clip_min=calibrator_params.get("clip_min"),
+        clip_max=calibrator_params.get("clip_max"),
+        low_support=int(calibrator_params.get("low_support", 50)),
+        window_size=calibrator_params.get("window_size"),
+        init_thresholds=calibrator_params.get("init_thresholds"),
+    )
     budget_controller = BudgetController(budget_fraction=budget_fraction)
     rollback = RollbackBuffer()
     effective_budget_tokens: List[float] = []
@@ -592,14 +884,25 @@ def run_rule_gate(
     final_consistency: List[float] = []
     risk_threshold_history: List[float] = []
     delta_violation_history: List[float] = []
+    applied_thresholds: Dict[int, Dict[str, float]] = {}
     total_start = time.time()
     sampler = GPUUtilSampler(interval_sec=0.5)
     sampler.start()
 
-    for prompt in prompts:
+    is_wikitext = task_name == "wikitext"
+    is_lambada = task_name == "lambada"
+    is_gsm8k = task_name == "gsm8k"
+    ppl_stats: Dict[str, float] = {"nll_sum": 0.0, "token_count": 0.0}
+    lambada_correct = 0
+    lambada_total = len(labels) if is_lambada and labels is not None else 0
+    gsm_correct = 0
+    gsm_total = len(labels) if is_gsm8k and labels is not None else 0
+
+    for prompt_idx, prompt in enumerate(prompts):
         state = engine.encode_prompt(prompt)
         prev_hidden: Optional[List[np.ndarray]] = None
         prev_logits: Optional[np.ndarray] = None
+        prev_aux: Optional[Dict] = None
 
         total_tokens_computed = 0
         total_tokens_possible = 0
@@ -615,6 +918,7 @@ def run_rule_gate(
                 out = engine.step(state, t)
                 prev_hidden = [h.copy() for h in out.hidden_by_layer]
                 prev_logits = out.logits.copy()
+                prev_aux = out.aux if isinstance(out.aux, dict) else None
                 seq_len = out.logits.shape[0]
                 if num_layers_seen is None:
                     num_layers_seen = len(out.hidden_by_layer)
@@ -638,6 +942,10 @@ def run_rule_gate(
 
             rollback.save(state)
             out = engine.step(state, t, compute_mask=mask_to_use)
+            try:
+                sampler.sample_once()
+            except Exception:
+                pass
 
             obs = compute_token_observables(
                 out.hidden_by_layer,
@@ -651,11 +959,16 @@ def run_rule_gate(
             risk_scores = compute_risk_score(obs.cosine_norm, obs.delta_l2_norm, obs.kl)
 
             watchdog_mask = (obs.cosine < watchdog_min_cos) | (obs.kl > watchdog_max_kl)
+            watchdog_mask_snapshot = watchdog_mask.copy()
             if np.any(watchdog_mask):
-                calibrator.register(risk_scores, unsafe_mask=watchdog_mask)
+                calibrator.register(step=t, scores=risk_scores, unsafe_mask=watchdog_mask)
                 rollback.restore(state)
                 mask_to_use = None
                 out = engine.step(state, t, compute_mask=None)
+                try:
+                    sampler.sample_once()
+                except Exception:
+                    pass
                 obs = compute_token_observables(
                     out.hidden_by_layer,
                     prev_hidden_snapshot,
@@ -680,12 +993,21 @@ def run_rule_gate(
             skip_stats_rows.append(f"{t},{seq_len},{frozen_tokens},{frozen_ratio:.6f},{num_layers_seen},0")
             freeze_ratios_by_step[t].append(frozen_ratio)
 
-            risk_threshold = calibrator.effective_threshold(risk_scores)
+            risk_threshold = calibrator.effective_threshold(step=t, candidate_scores=risk_scores)
             risk_threshold_history.append(risk_threshold)
             if risk_scores.size > 0:
                 delta_violation_history.append(float(np.mean(risk_scores > risk_threshold)))
+            cosine_override = stepwise_thresholds.cosine_for_step(t) if stepwise_thresholds else None
+            delta_override = stepwise_thresholds.delta_for_step(t) if stepwise_thresholds else None
+            margin_override = stepwise_thresholds.margin_for_step(t) if stepwise_thresholds else None
+            if stepwise_thresholds is not None:
+                applied_thresholds[t] = {
+                    "cosine_tau": float(cosine_override if cosine_override is not None else cfg.cosine_tau),
+                    "delta_l2_rho": float(delta_override if delta_override is not None else cfg.delta_l2_rho),
+                    "gamma_margin": float(margin_override if margin_override is not None else cfg.gamma_margin),
+                }
 
-            gate.update(
+            result = gate.update(
                 feats_cos=obs.cosine,
                 feats_dl2=obs.delta_l2,
                 feats_kl=obs.kl,
@@ -696,12 +1018,68 @@ def run_rule_gate(
                 num_tokens=out.logits.shape[0],
                 compute_mask=mask_to_use,
                 budget_controller=budget_controller,
+                cosine_tau_override=cosine_override,
+                delta_l2_override=delta_override,
+                gamma_margin_override=margin_override,
             )
+
+            if decision_logger is not None:
+                freeze_mask = result.freeze_mask
+                if freeze_mask is None:
+                    freeze_mask = np.zeros(out.logits.shape[0], dtype=bool)
+                counters_snapshot = result.counters
+                for token_idx in range(out.logits.shape[0]):
+                    decision_label = "freeze" if bool(freeze_mask[token_idx]) else "keep"
+                    k_applied = cfg.freeze_K if decision_label == "freeze" else 0
+                    decision_logger.log_decision(
+                        prompt_id=prompt_idx,
+                        step=t,
+                        token_idx=token_idx,
+                        decision=decision_label,
+                        k_applied=k_applied,
+                        risk=float(risk_scores[token_idx]),
+                        risk_threshold=float(risk_threshold),
+                        margin=float(obs.margin[token_idx]),
+                        kl=float(obs.kl[token_idx]),
+                        one_minus_cos=float(1.0 - obs.cosine[token_idx]),
+                        delta_l2=float(obs.delta_l2[token_idx]),
+                        delta_l2_norm=float(obs.delta_l2_norm[token_idx]),
+                        sigma=float(obs.sigma[token_idx]),
+                        layer_band="global",
+                        profile=profile,
+                        extras={
+                            "watchdog_triggered": bool(watchdog_mask_snapshot[token_idx]),
+                            "counter": int(counters_snapshot[token_idx]),
+                        },
+                    )
 
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
             prev_logits = out.logits.copy()
+            prev_aux = out.aux if isinstance(out.aux, dict) else None
 
         per_seq_latency_ms.append((time.time() - seq_start) * 1000.0)
+
+        final_tokens: Optional[List[int]] = None
+        final_margins: Optional[List[float]] = None
+        if prev_logits is not None:
+            if is_wikitext and prev_aux is not None:
+                input_ids = prev_aux.get("input_ids") if isinstance(prev_aux, dict) else None
+                special_mask = prev_aux.get("special_tokens_mask") if isinstance(prev_aux, dict) else None
+                pad_token_id = int(prev_aux.get("pad_token_id", -1)) if isinstance(prev_aux, dict) else -1
+                if input_ids is not None:
+                    _accumulate_ppl(ppl_stats, prev_logits, input_ids, pad_token_id, special_mask)
+            final_tokens, final_margins = logits_argmax_and_margin(prev_logits)
+            decoded_text = engine.decode_tokens(final_tokens).strip()
+            if is_lambada and labels is not None and prompt_idx < len(labels):
+                gold_word = labels[prompt_idx]
+                pred_word = _extract_last_word(decoded_text)
+                if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
+                    lambada_correct += 1
+            if is_gsm8k and labels is not None and prompt_idx < len(labels):
+                gold_ans = labels[prompt_idx]
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                if pred_ans == _normalize_gsm_answer(str(gold_ans)):
+                    gsm_correct += 1
 
         # Token savings (old): per-step token compute ratio
         token_savings = 1.0 - (total_tokens_computed / max(1, total_tokens_possible))
@@ -723,6 +1101,16 @@ def run_rule_gate(
             f.write("step,seq_len,frozen_tokens,frozen_ratio,num_layers,skipped_layers\n")
             for row in skip_stats_rows:
                 f.write(row + "\n")
+
+        if decision_logger is not None and prev_logits is not None and final_tokens is not None and final_margins is not None:
+            checksum = float(np.sum(prev_logits)) if prev_logits.size else 0.0
+            decision_logger.log_final_output(
+                prompt_id=prompt_idx,
+                tokens=final_tokens,
+                margins=final_margins,
+                logits_checksum=checksum,
+                extras={"prompt_length": len(prompt)},
+            )
 
         if consistency_check:
             # Run full-compute baseline for the same prompt and compare final token argmax
@@ -757,9 +1145,49 @@ def run_rule_gate(
     except Exception:
         pass
 
+    thresholds_manifest_path: Optional[str] = None
+    if stepwise_thresholds is not None:
+        thresholds_manifest_path = os.path.join(
+            out_dirs["runs"], f"rule_gate_stepwise_thresholds_{timestamp}.json"
+        )
+        with open(thresholds_manifest_path, "w", encoding="utf-8") as fp:
+            json.dump(
+                {
+                    "source": stepwise_thresholds.source_path,
+                    "applied": {str(k): v for k, v in sorted(applied_thresholds.items())},
+                    "cosine_tau": [float(x) for x in stepwise_thresholds.cosine_tau],
+                    "delta_l2_rho": [float(x) for x in stepwise_thresholds.delta_l2_rho],
+                    "gamma_margin": None if stepwise_thresholds.gamma_margin is None else [float(x) for x in stepwise_thresholds.gamma_margin],
+                },
+                fp,
+                indent=2,
+            )
+
     total_time_s = max(1e-6, time.time() - total_start)
     sampler.stop()
     gpu = sampler.metrics or (query_gpu_utilization() or {})
+
+    quality_metrics: Dict[str, Dict[str, float]] = {}
+    if is_wikitext and ppl_stats["token_count"] > 0:
+        ppl_value = float(np.exp(ppl_stats["nll_sum"] / ppl_stats["token_count"]))
+        quality_metrics["perplexity"] = {
+            "value": ppl_value,
+            "token_count": int(ppl_stats["token_count"]),
+            "nll_sum": float(ppl_stats["nll_sum"]),
+        }
+    if is_lambada and lambada_total:
+        quality_metrics["accuracy"] = {
+            "value": float(lambada_correct / lambada_total if lambada_total else 0.0),
+            "correct": int(lambada_correct),
+            "total": int(lambada_total),
+        }
+    if is_gsm8k and gsm_total:
+        quality_metrics["exact_match"] = {
+            "value": float(gsm_correct / gsm_total if gsm_total else 0.0),
+            "correct": int(gsm_correct),
+            "total": int(gsm_total),
+        }
+
     summary = {
         "mode": "rule_gate",
         "num_prompts": len(prompts),
@@ -776,8 +1204,14 @@ def run_rule_gate(
         "budget_fraction_target": float(budget_fraction),
         "budget_fraction_tokens": float(np.mean(effective_budget_tokens)) if effective_budget_tokens else None,
         "risk_delta": float(risk_delta),
+        "stepwise_thresholds": thresholds_manifest_path,
+        "stepwise_thresholds_source": stepwise_thresholds.source_path if stepwise_thresholds is not None else None,
+        "decision_log": decision_logger.decision_path if decision_logger is not None else None,
+        "final_outputs_path": decision_logger.final_outputs_path if decision_logger is not None else None,
         **{f"gpu_{k}": v for k, v in gpu.items()},
     }
+    if quality_metrics:
+        summary["quality"] = quality_metrics
     with open(os.path.join(out_dirs["runs"], f"rule_gate_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
@@ -793,6 +1227,11 @@ def run_learned_gate(
     risk_delta: float,
     budget_fraction: float,
     consistency_check: bool = False,
+    calibrator_cfg: Optional[Dict[str, object]] = None,
+    decision_logger: Optional[DecisionLogger] = None,
+    profile: Optional[str] = None,
+    labels: Optional[List[str]] = None,
+    task_name: Optional[str] = None,
 ) -> None:
     from src.viz.plots import save_hist
 
@@ -807,15 +1246,36 @@ def run_learned_gate(
     total_start = time.time()
     sampler = GPUUtilSampler(interval_sec=0.5)
     sampler.start()
-    calibrator = ConformalRiskCalibrator(delta=risk_delta, initial_quantile=0.60)
+    calibrator_params = calibrator_cfg or {}
+    calibrator = StepwiseConformalCalibrator(
+        delta=risk_delta,
+        num_steps=num_steps,
+        initial_quantile=float(calibrator_params.get("initial_quantile", 0.60)),
+        ema_alpha=calibrator_params.get("ema_alpha"),
+        clip_min=calibrator_params.get("clip_min"),
+        clip_max=calibrator_params.get("clip_max"),
+        low_support=int(calibrator_params.get("low_support", 50)),
+        window_size=calibrator_params.get("window_size"),
+        init_thresholds=calibrator_params.get("init_thresholds"),
+    )
     budget_controller = BudgetController(budget_fraction=budget_fraction)
     risk_threshold_history: List[float] = []
     delta_violation_history: List[float] = []
 
-    for prompt in prompts:
+    is_wikitext = task_name == "wikitext"
+    is_lambada = task_name == "lambada"
+    is_gsm8k = task_name == "gsm8k"
+    ppl_stats: Dict[str, float] = {"nll_sum": 0.0, "token_count": 0.0}
+    lambada_correct = 0
+    lambada_total = len(labels) if is_lambada and labels is not None else 0
+    gsm_correct = 0
+    gsm_total = len(labels) if is_gsm8k and labels is not None else 0
+
+    for prompt_idx, prompt in enumerate(prompts):
         state = engine.encode_prompt(prompt)
         prev_hidden: Optional[List[np.ndarray]] = None
         prev_logits: Optional[np.ndarray] = None
+        prev_aux: Optional[Dict] = None
 
         total_tokens_computed = 0
         total_tokens_possible = 0
@@ -826,6 +1286,7 @@ def run_learned_gate(
                 out = engine.step(state, t)
                 prev_hidden = [h.copy() for h in out.hidden_by_layer]
                 prev_logits = out.logits.copy()
+                prev_aux = out.aux if isinstance(out.aux, dict) else None
                 total_tokens_computed += out.logits.shape[0]
                 total_tokens_possible += out.logits.shape[0]
                 continue
@@ -862,7 +1323,7 @@ def run_learned_gate(
 
             watchdog_mask = (obs.cosine < watchdog_min_cos) | (obs.kl > watchdog_max_kl)
             if np.any(watchdog_mask):
-                calibrator.register(risk_scores, unsafe_mask=watchdog_mask)
+                calibrator.register(step=t, scores=risk_scores, unsafe_mask=watchdog_mask)
                 mask_to_use = None
                 out = engine.step(state, t, compute_mask=None)
                 obs = compute_token_observables(
@@ -893,7 +1354,7 @@ def run_learned_gate(
                 ],
                 axis=-1,
             ).astype(np.float32)
-            risk_threshold = calibrator.effective_threshold(risk_scores)
+            risk_threshold = calibrator.effective_threshold(step=t, candidate_scores=risk_scores)
             risk_threshold_history.append(risk_threshold)
             if risk_scores.size > 0:
                 delta_violation_history.append(float(np.mean(risk_scores > risk_threshold)))
@@ -909,8 +1370,41 @@ def run_learned_gate(
             if gate_result.probabilities is not None:
                 prob_samples.extend(gate_result.probabilities.tolist())
 
+            if decision_logger is not None:
+                freeze_mask = gate_result.freeze_mask
+                if freeze_mask is None:
+                    freeze_mask = np.zeros(out.logits.shape[0], dtype=bool)
+                probabilities = gate_result.probabilities if gate_result.probabilities is not None else np.zeros(out.logits.shape[0], dtype=np.float32)
+                counters_snapshot = gate_result.counters
+                for token_idx in range(out.logits.shape[0]):
+                    decision_label = "freeze" if bool(freeze_mask[token_idx]) else "keep"
+                    k_applied = gate.cfg.freeze_K if decision_label == "freeze" else 0
+                    decision_logger.log_decision(
+                        prompt_id=prompt_idx,
+                        step=t,
+                        token_idx=token_idx,
+                        decision=decision_label,
+                        k_applied=k_applied,
+                        risk=float(risk_scores[token_idx]),
+                        risk_threshold=float(risk_threshold),
+                        margin=float(obs.margin[token_idx]),
+                        kl=float(obs.kl[token_idx]),
+                        one_minus_cos=float(1.0 - obs.cosine[token_idx]),
+                        delta_l2=float(obs.delta_l2[token_idx]),
+                        delta_l2_norm=float(obs.delta_l2_norm[token_idx]),
+                        sigma=float(obs.sigma[token_idx]),
+                        layer_band="global",
+                        profile=profile,
+                        extras={
+                            "watchdog_triggered": bool(watchdog_mask_snapshot[token_idx]),
+                            "probability": float(probabilities[token_idx]),
+                            "counter": int(counters_snapshot[token_idx]),
+                        },
+                    )
+
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
             prev_logits = out.logits.copy()
+            prev_aux = out.aux if isinstance(out.aux, dict) else None
 
         per_seq_latency_ms.append((time.time() - seq_start) * 1000.0)
 
@@ -918,6 +1412,38 @@ def run_learned_gate(
         savings_ratios.append(float(savings))
         effective_budget_tokens.append(1.0 - savings)
         aggregates.append({"mode": "learned_gate", "prompt_len": len(prompt), "savings": float(savings)})
+
+        final_tokens: Optional[List[int]] = None
+        final_margins: Optional[List[float]] = None
+        if prev_logits is not None:
+            if is_wikitext and prev_aux is not None:
+                input_ids = prev_aux.get("input_ids") if isinstance(prev_aux, dict) else None
+                special_mask = prev_aux.get("special_tokens_mask") if isinstance(prev_aux, dict) else None
+                pad_token_id = int(prev_aux.get("pad_token_id", -1)) if isinstance(prev_aux, dict) else -1
+                if input_ids is not None:
+                    _accumulate_ppl(ppl_stats, prev_logits, input_ids, pad_token_id, special_mask)
+            final_tokens, final_margins = logits_argmax_and_margin(prev_logits)
+            decoded_text = engine.decode_tokens(final_tokens).strip()
+            if is_lambada and labels is not None and prompt_idx < len(labels):
+                gold_word = labels[prompt_idx]
+                pred_word = _extract_last_word(decoded_text)
+                if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
+                    lambada_correct += 1
+            if is_gsm8k and labels is not None and prompt_idx < len(labels):
+                gold_ans = labels[prompt_idx]
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                if pred_ans == _normalize_gsm_answer(str(gold_ans)):
+                    gsm_correct += 1
+
+        if decision_logger is not None and prev_logits is not None and final_tokens is not None and final_margins is not None:
+            checksum = float(np.sum(prev_logits)) if prev_logits.size else 0.0
+            decision_logger.log_final_output(
+                prompt_id=prompt_idx,
+                tokens=final_tokens,
+                margins=final_margins,
+                logits_checksum=checksum,
+                extras={"prompt_length": len(prompt)},
+            )
 
         if consistency_check:
             baseline_state = engine.encode_prompt(prompt)
@@ -957,6 +1483,28 @@ def run_learned_gate(
     total_time_s = max(1e-6, time.time() - total_start)
     sampler.stop()
     gpu = sampler.metrics or (query_gpu_utilization() or {})
+
+    quality_metrics: Dict[str, Dict[str, float]] = {}
+    if is_wikitext and ppl_stats["token_count"] > 0:
+        ppl_value = float(np.exp(ppl_stats["nll_sum"] / ppl_stats["token_count"]))
+        quality_metrics["perplexity"] = {
+            "value": ppl_value,
+            "token_count": int(ppl_stats["token_count"]),
+            "nll_sum": float(ppl_stats["nll_sum"]),
+        }
+    if is_lambada and lambada_total:
+        quality_metrics["accuracy"] = {
+            "value": float(lambada_correct / lambada_total if lambada_total else 0.0),
+            "correct": int(lambada_correct),
+            "total": int(lambada_total),
+        }
+    if is_gsm8k and gsm_total:
+        quality_metrics["exact_match"] = {
+            "value": float(gsm_correct / gsm_total if gsm_total else 0.0),
+            "correct": int(gsm_correct),
+            "total": int(gsm_total),
+        }
+
     summary = {
         "mode": "learned_gate",
         "num_prompts": len(prompts),
@@ -972,8 +1520,12 @@ def run_learned_gate(
         "budget_fraction": float(np.mean(effective_budget_tokens)) if effective_budget_tokens else None,
         "budget_fraction_target": float(budget_fraction),
         "risk_delta": float(risk_delta),
+        "decision_log": decision_logger.decision_path if decision_logger is not None else None,
+        "final_outputs_path": decision_logger.final_outputs_path if decision_logger is not None else None,
         **{f"gpu_{k}": v for k, v in gpu.items()},
     }
+    if quality_metrics:
+        summary["quality"] = quality_metrics
     with open(os.path.join(out_dirs["runs"], f"learned_gate_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
@@ -986,6 +1538,8 @@ def run_adaptive(
     scheduler_cfg: AdaptiveSchedulerConfig,
     risk_delta: float,
     skip_budget: float,
+    labels: Optional[List[str]] = None,
+    task_name: Optional[str] = None,
 ) -> None:
     scheduler = AdaptiveScheduler(scheduler_cfg)
     calibrator = ConformalRiskCalibrator(delta=risk_delta)
@@ -997,10 +1551,20 @@ def run_adaptive(
     lte_threshold_traces: List[List[float]] = []
     total_start = time.time()
 
-    for prompt in prompts:
+    is_wikitext = task_name == "wikitext"
+    is_lambada = task_name == "lambada"
+    is_gsm8k = task_name == "gsm8k"
+    ppl_stats: Dict[str, float] = {"nll_sum": 0.0, "token_count": 0.0}
+    lambada_correct = 0
+    lambada_total = len(labels) if is_lambada and labels is not None else 0
+    gsm_correct = 0
+    gsm_total = len(labels) if is_gsm8k and labels is not None else 0
+
+    for prompt_idx, prompt in enumerate(prompts):
         state = engine.encode_prompt(prompt)
         prev_hidden: Optional[List[np.ndarray]] = None
         prev_logits: Optional[np.ndarray] = None
+        prev_aux: Optional[Dict] = None
         seq_start = time.time()
         effective_steps = 0.0
         prompt_lte: List[float] = []
@@ -1014,6 +1578,7 @@ def run_adaptive(
             if prev_hidden is None or prev_logits is None:
                 prev_hidden = [h.copy() for h in out.hidden_by_layer]
                 prev_logits = out.logits.copy()
+                prev_aux = out.aux if isinstance(out.aux, dict) else None
                 effective_steps += 1.0
                 prompt_stride.append(scheduler.stride)
                 continue
@@ -1050,8 +1615,28 @@ def run_adaptive(
 
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
             prev_logits = out.logits.copy()
+            prev_aux = out.aux if isinstance(out.aux, dict) else None
 
         per_seq_latency_ms.append((time.time() - seq_start) * 1000.0)
+        if prev_logits is not None:
+            if is_wikitext and prev_aux is not None:
+                input_ids = prev_aux.get("input_ids") if isinstance(prev_aux, dict) else None
+                special_mask = prev_aux.get("special_tokens_mask") if isinstance(prev_aux, dict) else None
+                pad_token_id = int(prev_aux.get("pad_token_id", -1)) if isinstance(prev_aux, dict) else -1
+                if input_ids is not None:
+                    _accumulate_ppl(ppl_stats, prev_logits, input_ids, pad_token_id, special_mask)
+            tokens, _ = logits_argmax_and_margin(prev_logits)
+            decoded_text = engine.decode_tokens(tokens).strip()
+            if is_lambada and labels is not None and prompt_idx < len(labels):
+                gold_word = labels[prompt_idx]
+                pred_word = _extract_last_word(decoded_text)
+                if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
+                    lambada_correct += 1
+            if is_gsm8k and labels is not None and prompt_idx < len(labels):
+                gold_ans = labels[prompt_idx]
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                if pred_ans == _normalize_gsm_answer(str(gold_ans)):
+                    gsm_correct += 1
         nominal_steps = float(num_steps)
         skip_estimates.append(max(0.0, 1.0 - (effective_steps / nominal_steps)))
         scheduler.reset()
@@ -1082,6 +1667,26 @@ def run_adaptive(
         )
     except Exception:
         pass
+    quality_metrics: Dict[str, Dict[str, float]] = {}
+    if is_wikitext and ppl_stats["token_count"] > 0:
+        ppl_value = float(np.exp(ppl_stats["nll_sum"] / ppl_stats["token_count"]))
+        quality_metrics["perplexity"] = {
+            "value": ppl_value,
+            "token_count": int(ppl_stats["token_count"]),
+            "nll_sum": float(ppl_stats["nll_sum"]),
+        }
+    if is_lambada and lambada_total:
+        quality_metrics["accuracy"] = {
+            "value": float(lambada_correct / lambada_total if lambada_total else 0.0),
+            "correct": int(lambada_correct),
+            "total": int(lambada_total),
+        }
+    if is_gsm8k and gsm_total:
+        quality_metrics["exact_match"] = {
+            "value": float(gsm_correct / gsm_total if gsm_total else 0.0),
+            "correct": int(gsm_correct),
+            "total": int(gsm_total),
+        }
     summary = {
         "mode": "adaptive",
         "num_prompts": len(prompts),
@@ -1095,6 +1700,8 @@ def run_adaptive(
         "lte_eps": float(scheduler_cfg.lte_eps),
         "max_stride": int(scheduler_cfg.max_stride),
     }
+    if quality_metrics:
+        summary["quality"] = quality_metrics
     with open(os.path.join(out_dirs["runs"], f"adaptive_summary_{timestamp}.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
@@ -1184,11 +1791,57 @@ def main() -> None:
     consecutive_m = int(coalesce(args.m, cfg.get("m"), 2))
     freeze_K = int(coalesce(args.freeze_K, cfg.get("freeze_K"), 2))
     layer_recompute_M = int(coalesce(args.layer_recompute_M, cfg.get("layer_recompute_M"), 2))
+    stepwise_cfg = cfg.get("stepwise_thresholds", {})
+    gamma_margin = float(coalesce(args.gamma_margin, cfg.get("gamma_margin"), stepwise_cfg.get("margin_gamma"), 0.08))
     watchdog_cfg = cfg.get("watchdog", {})
     watchdog_min_cos = float(coalesce(args.watchdog_min_cos, watchdog_cfg.get("min_cos"), 0.90))
     watchdog_max_kl = float(coalesce(args.watchdog_max_kl, watchdog_cfg.get("max_kl"), 0.02))
     risk_delta = float(coalesce(args.risk_delta, cfg.get("risk_delta"), 0.01))
     budget_fraction = float(coalesce(args.budget_fraction, cfg.get("budget_fraction"), 1.0))
+    quantiles_path_raw = coalesce(args.quantiles_path, cfg.get("quantiles_path"), stepwise_cfg.get("quantiles_path"))
+    cos_quantile_level_raw = coalesce(args.one_minus_cos_quantile, cfg.get("one_minus_cos_quantile"), stepwise_cfg.get("one_minus_cos_q"))
+    delta_quantile_level_raw = coalesce(args.delta_l2_quantile, cfg.get("delta_l2_quantile"), stepwise_cfg.get("dl2_norm_q"))
+    kl_quantile_level_raw = coalesce(args.kl_quantile, cfg.get("kl_quantile"), stepwise_cfg.get("kl_q"))
+    stepwise_ema_raw = coalesce(args.stepwise_ema, cfg.get("stepwise_ema"), stepwise_cfg.get("ema"))
+    clip_min, clip_max = parse_clip_config(coalesce(args.stepwise_clip, cfg.get("stepwise_clip"), stepwise_cfg.get("clip_quantiles")))
+    stepwise_ema = float(stepwise_ema_raw) if stepwise_ema_raw is not None else None
+    cos_quantile_level = float(cos_quantile_level_raw) if cos_quantile_level_raw is not None else None
+    delta_quantile_level = float(delta_quantile_level_raw) if delta_quantile_level_raw is not None else None
+    kl_quantile_level = float(kl_quantile_level_raw) if kl_quantile_level_raw is not None else None
+    quantiles_path = None
+    if quantiles_path_raw:
+        quantiles_path = quantiles_path_raw if os.path.isabs(quantiles_path_raw) else os.path.abspath(os.path.join(repo_root, quantiles_path_raw))
+    risk_quantiles_path_raw = coalesce(args.risk_quantiles_path, cfg.get("risk_quantiles_path"), stepwise_cfg.get("risk_quantiles_path"))
+    risk_initial_quantile_raw = coalesce(args.risk_initial_quantile, cfg.get("risk_initial_quantile"), stepwise_cfg.get("risk_initial_quantile"), 0.60)
+    risk_initial_quantile = float(risk_initial_quantile_raw) if risk_initial_quantile_raw is not None else 0.60
+    risk_low_support_raw = coalesce(args.risk_low_support, cfg.get("risk_low_support"), stepwise_cfg.get("risk_low_support"), 50)
+    risk_low_support = int(risk_low_support_raw) if risk_low_support_raw is not None else 50
+    risk_window_raw = coalesce(args.risk_window, cfg.get("risk_window"), stepwise_cfg.get("risk_window"))
+    risk_window = int(risk_window_raw) if risk_window_raw else None
+    risk_quantiles_path = None
+    if risk_quantiles_path_raw:
+        risk_quantiles_path = risk_quantiles_path_raw if os.path.isabs(risk_quantiles_path_raw) else os.path.abspath(os.path.join(repo_root, risk_quantiles_path_raw))
+    risk_init_thresholds = None
+    if risk_quantiles_path and os.path.exists(risk_quantiles_path):
+        with open(risk_quantiles_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        steps_block = data.get("steps") if isinstance(data, dict) else None
+        if isinstance(steps_block, dict):
+            risk_init_thresholds = {int(step): float(val) for step, val in steps_block.items() if val is not None}
+        else:
+            risk_init_thresholds = {int(step): float(val) for step, val in data.items() if val is not None}
+
+    calibrator_cfg = {
+        "initial_quantile": risk_initial_quantile,
+        "ema_alpha": stepwise_ema,
+        "clip_min": clip_min,
+        "clip_max": clip_max,
+        "low_support": risk_low_support,
+        "window_size": risk_window,
+        "init_thresholds": risk_init_thresholds,
+    }
+    risk_manifest_cfg = dict(calibrator_cfg)
+    risk_manifest_cfg["risk_quantiles_path"] = risk_quantiles_path
 
     outputs_root = str(outputs_root)
     run_dir = ensure_output_dirs(outputs_root, phase=phase, mode=mode, engine=engine_name, exp_name=exp_name)
@@ -1216,9 +1869,20 @@ def main() -> None:
             "m": consecutive_m,
             "freeze_K": freeze_K,
             "layer_recompute_M": layer_recompute_M,
+            "gamma_margin": gamma_margin,
             "watchdog_min_cos": watchdog_min_cos,
             "watchdog_max_kl": watchdog_max_kl,
         },
+        "stepwise_thresholds": {
+            "quantiles_path": quantiles_path,
+            "one_minus_cos_quantile": cos_quantile_level,
+            "delta_l2_quantile": delta_quantile_level,
+            "kl_quantile": kl_quantile_level,
+            "ema": stepwise_ema,
+            "clip_min": clip_min,
+            "clip_max": clip_max,
+        },
+        "risk_calibrator": risk_manifest_cfg,
     }
     save_manifest(run_dir, {
         "args": vars(args),
@@ -1274,124 +1938,193 @@ def main() -> None:
     else:
         raise ValueError(f"Unsupported engine: {engine_name}")
 
-    prompts = load_prompts(num_prompts, task, data_root)
+    prompts, prompt_labels = load_prompts(num_prompts, task, data_root)
     out_dirs = {"figures": os.path.join(run_dir, "figures"), "runs": os.path.join(run_dir, "runs")}
 
-    feature_path: Optional[str] = None
-    with Timer(f"run-{mode}"):
-        if mode == "teacher":
-            feature_path = run_teacher(
-                engine,
-                prompts,
-                out_dirs,
-                num_steps,
-                dump_features_dir=dump_features_dir,
-                label_thresholds=label_thresholds,
-                oracle_eval=bool(args.oracle_eval or cfg.get("oracle_eval", False)),
-            )
-            if args.consistency_full_compute and engine_name == "d2f":
-                # Full-compute twice to verify stability; write difference report
-                diffs_csv = os.path.join(out_dirs["runs"], f"consistency_diffs_{time.strftime('%Y%m%d_%H%M%S')}.csv")
-                with open(diffs_csv, "w", encoding="utf-8") as f:
-                    f.write("prompt_idx,step,logits_match,hidden_cos_mean\n")
-                    for pi, prompt in enumerate(prompts):
-                        s1 = engine.encode_prompt(prompt)
-                        s2 = engine.encode_prompt(prompt)
-                        prev1_h = prev2_h = None
-                        prev1_z = prev2_z = None
-                        for t in range(num_steps):
-                            o1 = engine.step(s1, t, compute_mask=None)
-                            o2 = engine.step(s2, t, compute_mask=None)
-                            logits_match = int(np.allclose(o1.logits, o2.logits, atol=1e-6))
-                            hidden_cos_mean = 1.0
-                            if prev1_h is not None and prev2_h is not None:
-                                c1 = cosine_similarity_tokens(o1.hidden_by_layer, prev1_h)
-                                c2 = cosine_similarity_tokens(o2.hidden_by_layer, prev2_h)
-                                hidden_cos_mean = float(0.5 * (np.mean(c1) + np.mean(c2)))
-                            f.write(f"{pi},{t},{logits_match},{hidden_cos_mean:.6f}\n")
-                            prev1_h = [h.copy() for h in o1.hidden_by_layer]
-                            prev2_h = [h.copy() for h in o2.hidden_by_layer]
-                            prev1_z = o1.logits.copy()
-                            prev2_z = o2.logits.copy()
-        elif mode == "rule_gate":
-            rule_cfg = RuleGateConfig(
-                cosine_tau=tau,
-                delta_l2_rho=rho,
-                consecutive_m=consecutive_m,
-                freeze_K=freeze_K,
-                watchdog_min_cos=watchdog_min_cos,
-                watchdog_max_kl=watchdog_max_kl,
-                layer_recompute_M=layer_recompute_M,
-            )
-            run_rule_gate(
-                engine,
-                prompts,
-                out_dirs,
-                num_steps,
-                rule_cfg,
-                risk_delta=risk_delta,
-                budget_fraction=budget_fraction,
-                consistency_check=args.consistency_check,
-            )
-        elif mode == "learned_gate":
-            default_gate_path = str(Path(models_root) / "gates" / "learned_gate_latest.npz") if models_root else None
-            weights_path = coalesce(args.learned_gate_weights, cfg.get("learned_gate_weights"), default_gate_path)
-            if not weights_path or not os.path.exists(weights_path):
-                raise FileNotFoundError(f"Learned gate weights not found at {weights_path}")
-            weights = LearnedGateWeights.from_npz(weights_path)
-            threshold_override = coalesce(args.learned_gate_threshold, cfg.get("learned_gate_threshold"))
-            if threshold_override is not None:
-                weights.threshold = float(threshold_override)
-            learned_gate_cfg = LearnedGateConfig(
-                freeze_K=int(coalesce(args.learned_gate_freeze_K, cfg.get("learned_gate_freeze_K"), freeze_K)),
-                min_consecutive=int(coalesce(args.learned_gate_min_consecutive, cfg.get("learned_gate_min_consecutive"), consecutive_m)),
-            )
-            gate = LearnedGate(weights, learned_gate_cfg)
-            run_learned_gate(
-                engine,
-                prompts,
-                out_dirs,
-                num_steps,
-                gate,
-                watchdog_min_cos=watchdog_min_cos,
-                watchdog_max_kl=watchdog_max_kl,
-                risk_delta=risk_delta,
-                budget_fraction=budget_fraction,
-                consistency_check=args.consistency_check,
-            )
-        elif mode == "adaptive":
-            scheduler_cfg = AdaptiveSchedulerConfig(
-                lte_eps=float(args.lte_eps),
-                min_consecutive=int(args.lte_min_consec),
-                max_stride=int(args.max_stride),
-                base_stride=1,
-            )
-            run_adaptive(
-                engine,
-                prompts,
-                out_dirs,
-                num_steps,
-                scheduler_cfg=scheduler_cfg,
-                risk_delta=risk_delta,
-                skip_budget=float(args.adaptive_budget),
-            )
-        elif mode == "oracle":
-            feature_path = run_teacher(
-                engine,
-                prompts,
-                out_dirs,
-                num_steps,
-                dump_features_dir=dump_features_dir,
-                label_thresholds=label_thresholds,
-                oracle_eval=True,
-            )
-        elif mode == "baselines":
-            run_baselines(out_dirs, num_steps)
-        else:
-            raise ValueError(f"Unsupported mode: {mode}")
+    decision_loggers: List[DecisionLogger] = []
+    decision_logger: Optional[DecisionLogger] = None
+    if mode in {"rule_gate", "learned_gate"}:
+        decision_logger = DecisionLogger(run_dir, mode, os.path.basename(run_dir))
+        decision_loggers.append(decision_logger)
 
-    if feature_path:
-        print(f"[teacher] token features saved to {feature_path}")
+    teacher_artifacts: Optional[TeacherArtifacts] = None
+    try:
+        with Timer(f"run-{mode}"):
+            if mode == "teacher":
+                teacher_artifacts = run_teacher(
+                    engine,
+                    prompts,
+                    out_dirs,
+                    num_steps,
+                    dump_features_dir=dump_features_dir,
+                    label_thresholds=label_thresholds,
+                    oracle_eval=bool(args.oracle_eval or cfg.get("oracle_eval", False)),
+                    task_name=task,
+                    exp_name=exp_name,
+                    labels=prompt_labels,
+                )
+                if args.consistency_full_compute and engine_name == "d2f":
+                    # Full-compute twice to verify stability; write difference report
+                    diffs_csv = os.path.join(out_dirs["runs"], f"consistency_diffs_{time.strftime('%Y%m%d_%H%M%S')}.csv")
+                    with open(diffs_csv, "w", encoding="utf-8") as f:
+                        f.write("prompt_idx,step,logits_match,hidden_cos_mean\n")
+                        for pi, prompt in enumerate(prompts):
+                            s1 = engine.encode_prompt(prompt)
+                            s2 = engine.encode_prompt(prompt)
+                            prev1_h = prev2_h = None
+                            prev1_z = prev2_z = None
+                            for t in range(num_steps):
+                                o1 = engine.step(s1, t, compute_mask=None)
+                                o2 = engine.step(s2, t, compute_mask=None)
+                                logits_match = int(np.allclose(o1.logits, o2.logits, atol=1e-6))
+                                hidden_cos_mean = 1.0
+                                if prev1_h is not None and prev2_h is not None:
+                                    c1 = cosine_similarity_tokens(o1.hidden_by_layer, prev1_h)
+                                    c2 = cosine_similarity_tokens(o2.hidden_by_layer, prev2_h)
+                                    hidden_cos_mean = float(0.5 * (np.mean(c1) + np.mean(c2)))
+                                f.write(f"{pi},{t},{logits_match},{hidden_cos_mean:.6f}\n")
+                                prev1_h = [h.copy() for h in o1.hidden_by_layer]
+                                prev2_h = [h.copy() for h in o2.hidden_by_layer]
+                                prev1_z = o1.logits.copy()
+                                prev2_z = o2.logits.copy()
+            elif mode == "rule_gate":
+                stepwise_thresholds_obj: Optional[StepwiseThresholds] = None
+                if quantiles_path:
+                    if not os.path.exists(quantiles_path):
+                        raise FileNotFoundError(f"Quantiles file not found: {quantiles_path}")
+                    if cos_quantile_level is None or delta_quantile_level is None:
+                        raise ValueError("Stepwise thresholds require one_minus_cos_quantile and delta_l2_quantile")
+                    table = StepQuantileTable.load(quantiles_path)
+                    available_steps = table.num_steps if table.num_steps is not None else num_steps
+                    step_count = min(num_steps, int(available_steps))
+                    raw_one_minus_cos = [table.value("one_minus_cos", step, cos_quantile_level) for step in range(step_count)]
+                    raw_delta = [table.value("delta_l2_norm", step, delta_quantile_level) for step in range(step_count)]
+                    one_minus_cos_vals = clip_sequence(raw_one_minus_cos, clip_min, clip_max)
+                    delta_vals = clip_sequence(raw_delta, clip_min, clip_max)
+                    if stepwise_ema is not None:
+                        one_minus_cos_vals = apply_ema(one_minus_cos_vals, stepwise_ema)
+                        delta_vals = apply_ema(delta_vals, stepwise_ema)
+                    cosine_tau_steps = [float(np.clip(1.0 - val, -1.0, 1.0)) for val in one_minus_cos_vals]
+                    delta_l2_steps = [float(max(val, 0.0)) for val in delta_vals]
+                    gamma_steps = [float(gamma_margin)] * step_count
+                    stepwise_thresholds_obj = StepwiseThresholds(
+                        cosine_tau=cosine_tau_steps,
+                        delta_l2_rho=delta_l2_steps,
+                        gamma_margin=gamma_steps,
+                        source_path=quantiles_path,
+                    )
+                    if kl_quantile_level is not None:
+                        kl_values = [table.value("kl", step, kl_quantile_level) for step in range(step_count)]
+                        kl_values = clip_sequence(kl_values, clip_min, clip_max)
+                        if stepwise_ema is not None:
+                            kl_values = apply_ema(kl_values, stepwise_ema)
+                        if kl_values:
+                            watchdog_max_kl = max(float(max(kl_values)), watchdog_max_kl)
+                            resolved_manifest["rule_gate"]["watchdog_max_kl"] = watchdog_max_kl
+                    print(f"[rule_gate] Loaded stepwise thresholds from {quantiles_path} (steps={step_count})")
+
+                rule_cfg = RuleGateConfig(
+                    cosine_tau=tau,
+                    delta_l2_rho=rho,
+                    consecutive_m=consecutive_m,
+                    freeze_K=freeze_K,
+                    watchdog_min_cos=watchdog_min_cos,
+                    watchdog_max_kl=watchdog_max_kl,
+                    layer_recompute_M=layer_recompute_M,
+                    gamma_margin=gamma_margin,
+                )
+                run_rule_gate(
+                    engine,
+                    prompts,
+                    out_dirs,
+                    num_steps,
+                    rule_cfg,
+                    risk_delta=risk_delta,
+                    budget_fraction=budget_fraction,
+                    consistency_check=args.consistency_check,
+                    stepwise_thresholds=stepwise_thresholds_obj,
+                    calibrator_cfg=calibrator_cfg,
+                    decision_logger=decision_logger,
+                    profile=args.profile if hasattr(args, "profile") else None,
+                    labels=prompt_labels,
+                    task_name=task,
+                )
+            elif mode == "learned_gate":
+                default_gate_path = str(Path(models_root) / "gates" / "learned_gate_latest.npz") if models_root else None
+                weights_path = coalesce(args.learned_gate_weights, cfg.get("learned_gate_weights"), default_gate_path)
+                if not weights_path or not os.path.exists(weights_path):
+                    raise FileNotFoundError(f"Learned gate weights not found at {weights_path}")
+                weights = LearnedGateWeights.from_npz(weights_path)
+                threshold_override = coalesce(args.learned_gate_threshold, cfg.get("learned_gate_threshold"))
+                if threshold_override is not None:
+                    weights.threshold = float(threshold_override)
+                learned_gate_cfg = LearnedGateConfig(
+                    freeze_K=int(coalesce(args.learned_gate_freeze_K, cfg.get("learned_gate_freeze_K"), freeze_K)),
+                    min_consecutive=int(coalesce(args.learned_gate_min_consecutive, cfg.get("learned_gate_min_consecutive"), consecutive_m)),
+                )
+                gate = LearnedGate(weights, learned_gate_cfg)
+                run_learned_gate(
+                    engine,
+                    prompts,
+                    out_dirs,
+                    num_steps,
+                    gate,
+                    watchdog_min_cos=watchdog_min_cos,
+                    watchdog_max_kl=watchdog_max_kl,
+                    risk_delta=risk_delta,
+                    budget_fraction=budget_fraction,
+                    consistency_check=args.consistency_check,
+                    calibrator_cfg=calibrator_cfg,
+                    decision_logger=decision_logger,
+                    profile=args.profile if hasattr(args, "profile") else None,
+                    labels=prompt_labels,
+                    task_name=task,
+                )
+            elif mode == "adaptive":
+                scheduler_cfg = AdaptiveSchedulerConfig(
+                    lte_eps=float(args.lte_eps),
+                    min_consecutive=int(args.lte_min_consec),
+                    max_stride=int(args.max_stride),
+                    base_stride=1,
+                )
+                run_adaptive(
+                    engine,
+                    prompts,
+                    out_dirs,
+                    num_steps,
+                    scheduler_cfg=scheduler_cfg,
+                    risk_delta=risk_delta,
+                    skip_budget=float(args.adaptive_budget),
+                    labels=prompt_labels,
+                    task_name=task,
+                )
+            elif mode == "oracle":
+                teacher_artifacts = run_teacher(
+                    engine,
+                    prompts,
+                    out_dirs,
+                    num_steps,
+                    dump_features_dir=dump_features_dir,
+                    label_thresholds=label_thresholds,
+                    oracle_eval=True,
+                    task_name=task,
+                    exp_name=exp_name,
+                    labels=prompt_labels,
+                )
+            elif mode == "baselines":
+                run_baselines(out_dirs, num_steps)
+            else:
+                raise ValueError(f"Unsupported mode: {mode}")
+    finally:
+        close_loggers(decision_loggers)
+
+    if teacher_artifacts:
+        if teacher_artifacts.features_path:
+            print(f"[teacher] token features saved to {teacher_artifacts.features_path}")
+        if teacher_artifacts.quantiles_path:
+            print(f"[teacher] quantiles saved to {teacher_artifacts.quantiles_path}")
+        if teacher_artifacts.outputs_path:
+            print(f"[teacher] final outputs saved to {teacher_artifacts.outputs_path}")
 
     if wandb_run is not None:
         try:

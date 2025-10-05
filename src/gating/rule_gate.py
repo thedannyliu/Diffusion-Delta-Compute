@@ -63,12 +63,19 @@ class RuleGate:
         num_tokens: int,
         compute_mask: Optional[np.ndarray] = None,
         budget_controller: Optional[BudgetController] = None,
+        cosine_tau_override: Optional[float] = None,
+        delta_l2_override: Optional[float] = None,
+        gamma_margin_override: Optional[float] = None,
     ) -> StepGateResult:
         self._ensure_state(num_tokens)
         counters = self._counters
         cooldown = self._cooldown
 
-        stable = ((feats_cos >= self.cfg.cosine_tau) | (feats_dl2 <= self.cfg.delta_l2_rho)) & (margin >= self.cfg.gamma_margin)
+        cosine_tau = float(self.cfg.cosine_tau if cosine_tau_override is None else cosine_tau_override)
+        delta_l2_rho = float(self.cfg.delta_l2_rho if delta_l2_override is None else delta_l2_override)
+        gamma_margin = float(self.cfg.gamma_margin if gamma_margin_override is None else gamma_margin_override)
+
+        stable = ((feats_cos >= cosine_tau) | (feats_dl2 <= delta_l2_rho)) & (margin >= gamma_margin)
         safe = stable & (risk_scores <= risk_threshold)
 
         if compute_mask is None:

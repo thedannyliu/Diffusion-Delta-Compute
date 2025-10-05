@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -41,4 +41,11 @@ class BaseEngine(ABC):
     def num_steps(self) -> int:
         raise NotImplementedError
 
+    def decode_tokens(self, token_ids: Sequence[int]) -> str:
+        """Decode a sequence of token ids into text (default: raises)."""
+        raise NotImplementedError("decode_tokens not implemented for this engine")
+
+    def decode_token(self, token_id: int) -> str:
+        """Decode a single token id into text."""
+        return self.decode_tokens([token_id])
 

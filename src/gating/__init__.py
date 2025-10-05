@@ -2,7 +2,7 @@
 
 from .rule_gate import RuleGate, RuleGateConfig, StepGateResult
 from .learned_gate import LearnedGate, LearnedGateConfig, LearnedGateWeights
-from .conformal import ConformalRiskCalibrator, compute_risk_score
+from .conformal import ConformalRiskCalibrator, StepwiseConformalCalibrator, compute_risk_score
 from .budget import BudgetController, apply_budget
 from .adaptive import AdaptiveScheduler, AdaptiveSchedulerConfig, heun_lte
 from .rollback import RollbackBuffer
@@ -15,6 +15,7 @@ __all__ = [
     "LearnedGateConfig",
     "LearnedGateWeights",
     "ConformalRiskCalibrator",
+    "StepwiseConformalCalibrator",
     "compute_risk_score",
     "BudgetController",
     "apply_budget",
@@ -23,4 +24,3 @@ __all__ = [
     "heun_lte",
     "RollbackBuffer",
 ]
-

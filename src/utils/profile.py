@@ -50,9 +50,12 @@ def query_gpu_utilization() -> Optional[Dict[str, float]]:
 
 
 class GPUUtilSampler:
-    """Background sampler for GPU utilization using nvidia-smi dmon or query.
+    """GPU utilization sampler.
 
-    Periodically updates a shared dict with keys: util_gpu, util_mem, mem_used, mem_total.
+    - Background mode: periodic sampling in a thread.
+    - Manual mode: call `sample_once()` at interesting points (e.g., after GPU ops).
+
+    Aggregates running mean for: util_gpu, util_mem, mem_used, mem_total.
     """
 
     def __init__(self, interval_sec: float = 0.5) -> None:
@@ -65,13 +68,19 @@ class GPUUtilSampler:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
-            data = query_gpu_utilization()
-            if data is not None:
-                self._count += 1
-                for key, value in data.items():
-                    self._sum[key] = self._sum.get(key, 0.0) + float(value)
-                self.metrics = {k: self._sum[k] / float(self._count) for k in self._sum}
+            self.sample_once()
             time.sleep(self.interval_sec)
+
+    def sample_once(self) -> None:
+        """Take a single instantaneous sample and fold into aggregates."""
+        data = query_gpu_utilization()
+        if data is None:
+            return
+        self._count += 1
+        for key, value in data.items():
+            self._sum[key] = self._sum.get(key, 0.0) + float(value)
+        if self._count > 0:
+            self.metrics = {k: self._sum[k] / float(self._count) for k in self._sum}
 
     def start(self) -> None:
         if self._thread is None:
