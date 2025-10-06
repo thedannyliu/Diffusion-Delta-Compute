@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:h100:1
 #SBATCH -c 8
 #SBATCH --mem=80G
-#SBATCH -t 06:00:00
+#SBATCH -t 01:00:00
 #SBATCH -o logs/%x-%j.out
 
 module load cuda/12.1 || true
@@ -39,7 +39,7 @@ ENGINE=${ENGINE:-d2f}
 
 # spec: TASK:N_PROMPTS:PROFILE:RISK_DELTA:EXP
 declare -a DATASETS=(
-  "gsm8k:200:balanced:0.010:gsm8k_rule"
+  "gsm8k:10:balanced:0.010:gsm8k_rule"
 )
 
 echo "[sbatch] P2 smoke triplet starting (engine=${ENGINE})"
