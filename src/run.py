@@ -1408,8 +1408,6 @@ def run_learned_gate(
             computed_tokens = seq_len if mask_to_use is None else int(np.sum(mask_to_use))
             total_tokens_computed += computed_tokens
             total_tokens_possible += seq_len
-            if seq_len > 0:
-                freeze_ratios_by_step[t].append(1.0 - (computed_tokens / float(seq_len)))
 
             obs = compute_token_observables(
                 out.hidden_by_layer,
@@ -1423,6 +1421,8 @@ def run_learned_gate(
             risk_scores = compute_risk_score(obs.cosine_norm, obs.delta_l2_norm, obs.kl)
 
             watchdog_mask = (obs.cosine < watchdog_min_cos) | (obs.kl > watchdog_max_kl)
+            # Snapshot before any potential reset so decision logs reflect the initial watchdog state
+            watchdog_mask_snapshot = watchdog_mask.copy()
             if np.any(watchdog_mask):
                 calibrator.register(step=t, scores=risk_scores, unsafe_mask=watchdog_mask)
                 mask_to_use = None
@@ -1441,6 +1441,10 @@ def run_learned_gate(
             computed_tokens = out.logits.shape[0] if mask_to_use is None else int(np.sum(mask_to_use))
             total_tokens_computed += computed_tokens
             total_tokens_possible += out.logits.shape[0]
+            # Track freeze ratio per step after compute mask is finalized
+            seq_len = out.logits.shape[0]
+            if seq_len > 0:
+                freeze_ratios_by_step[t].append(1.0 - (computed_tokens / float(seq_len)))
 
             # Use raw features to match training FEATURE_NAMES[:7]
             features = np.stack(
@@ -2105,10 +2109,25 @@ def main() -> None:
                     if cos_quantile_level is None or delta_quantile_level is None:
                         raise ValueError("Stepwise thresholds require one_minus_cos_quantile and delta_l2_quantile")
                     table = StepQuantileTable.load(quantiles_path)
-                    available_steps = table.num_steps if table.num_steps is not None else num_steps
-                    step_count = min(num_steps, int(available_steps))
-                    raw_one_minus_cos = [table.value("one_minus_cos", step, cos_quantile_level) for step in range(step_count)]
-                    raw_delta = [table.value("delta_l2_norm", step, delta_quantile_level) for step in range(step_count)]
+                    # Robust handling: quantile tables often start at step=1 since step=0 has no previous state.
+                    # Build thresholds for steps [0..num_steps-1] by copying from the nearest available step when missing.
+                    step_keys_present = sorted(int(k) for k in table.steps.keys())
+                    if not step_keys_present:
+                        raise ValueError(f"No steps present in quantiles file: {quantiles_path}")
+                    max_available = max(step_keys_present)
+                    step_count = min(num_steps, int(table.num_steps) if table.num_steps is not None else (max_available + 1))
+
+                    def _nearest_step(s: int) -> int:
+                        if s in step_keys_present:
+                            return s
+                        # choose nearest lower step; if none, use smallest present
+                        lower = [k for k in step_keys_present if k <= s]
+                        if lower:
+                            return max(lower)
+                        return step_keys_present[0]
+
+                    raw_one_minus_cos = [table.value("one_minus_cos", _nearest_step(step), cos_quantile_level) for step in range(step_count)]
+                    raw_delta = [table.value("delta_l2_norm", _nearest_step(step), delta_quantile_level) for step in range(step_count)]
                     one_minus_cos_vals = clip_sequence(raw_one_minus_cos, clip_min, clip_max)
                     delta_vals = clip_sequence(raw_delta, clip_min, clip_max)
                     if stepwise_ema is not None:
@@ -2124,7 +2143,7 @@ def main() -> None:
                         source_path=quantiles_path,
                     )
                     if kl_quantile_level is not None:
-                        kl_values = [table.value("kl", step, kl_quantile_level) for step in range(step_count)]
+                        kl_values = [table.value("kl", _nearest_step(step), kl_quantile_level) for step in range(step_count)]
                         kl_values = clip_sequence(kl_values, clip_min, clip_max)
                         if stepwise_ema is not None:
                             kl_values = apply_ema(kl_values, stepwise_ema)

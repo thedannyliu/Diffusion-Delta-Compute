@@ -37,26 +37,30 @@ mkdir -p logs models/gates
 CONFIG_PATH=${CONFIG_PATH:-configs/p3_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 WEIGHTS_OUT=${WEIGHTS_OUT:-models/gates/learned_gate_latest.npz}
+# 指定 P1 teacher 輸出根目錄（供 features 使用）
+P1_ROOT=${P1_ROOT:-/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251006_002834}
 
-# Train once from latest P1 features, then evaluate per dataset.
-echo "[sbatch] P3 training learned gate from latest P1 features"
+# Train once using P1 features, then evaluate per dataset.
+echo "[sbatch] P3 training learned gate from P1 features under: ${P1_ROOT}"
 srun --exclusive -N1 -n1 bash -lc '
+  set -euo pipefail
   PYTHON=${PYTHON:-python}
-  PROJECT_ROOT=$(pwd)
-  mapfile -t F < <(find "$PROJECT_ROOT/reports" -path "*teacher*features/teacher_features_*.npz" -print 2>/dev/null | sort)
-  if [[ ${#F[@]} -eq 0 ]]; then echo "[P3] ERROR: No P1 features found." >&2; exit 1; fi
-  "$PYTHON" -m src.learned.train_gate --features "${F[@]}" --out "'"$WEIGHTS_OUT"'" --epochs "${TRAIN_EPOCHS:-8}" --batch_size "${TRAIN_BATCH:-1024}" --lr "${TRAIN_LR:-1e-3}"
+  if [[ ! -d "'"$P1_ROOT"'" ]]; then echo "[P3] ERROR: P1_ROOT='"$P1_ROOT"' not found." >&2; exit 1; fi
+  mapfile -t F < <(find "'"$P1_ROOT"'/reports/artifacts/features" -maxdepth 1 -name "teacher_features_*.npz" -print 2>/dev/null | LC_ALL=C sort)
+  if (( ${#F[@]} == 0 )); then echo "[P3] ERROR: No teacher_features_*.npz under '"$P1_ROOT"'." >&2; exit 1; fi
+  echo "[learned_gate] Using features: ${F[-1]}"
+  "$PYTHON" -m src.learned.train_gate --features "${F[-1]}" --out "'"$WEIGHTS_OUT"'" --epochs "${TRAIN_EPOCHS:-8}" --batch_size "${TRAIN_BATCH:-1024}" --lr "${TRAIN_LR:-1e-3}"
 '
 
 declare -a DATASETS=(
-  "gsm8k:10:gsm8k_learned"
+  "gsm8k:1:gsm8k_learned"
 )
 
 for spec in "${DATASETS[@]}"; do
   IFS=':' read -r TASK N EPNAME <<<"$spec"
   echo "[sbatch][P3] Eval task=${TASK} n=${N}"
   srun --exclusive -N1 -n1 \
-    bash scripts/run_p3_learned_gate.sh "" "$CONFIG_PATH" \
+    "$PYTHON" -m src.run --mode learned_gate --config "$CONFIG_PATH" \
       --engine "$ENGINE" \
       --learned_gate_weights "$WEIGHTS_OUT" \
       --task "$TASK" \
@@ -65,11 +69,11 @@ for spec in "${DATASETS[@]}"; do
 
   echo "[sbatch][P3] Trace5 task=${TASK}"
   srun --exclusive -N1 -n1 \
-    bash scripts/run_p3_learned_gate.sh "" "$CONFIG_PATH" \
+    "$PYTHON" -m src.run --mode learned_gate --config "$CONFIG_PATH" \
       --engine "$ENGINE" \
       --learned_gate_weights "$WEIGHTS_OUT" \
       --task "$TASK" \
-      --num_prompts 5 \
+      --num_prompts 1 \
       --consistency_check \
       --exp_name "${EPNAME}_trace5"
 done

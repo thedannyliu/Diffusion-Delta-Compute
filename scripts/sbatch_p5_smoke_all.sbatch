@@ -39,7 +39,7 @@ CONFIG_BASE=${CONFIG_BASE:-configs/p5_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "gsm8k:10:gsm8k_p5"
+  "gsm8k:1:gsm8k_p5"
 )
 
 for spec in "${DATASETS[@]}"; do

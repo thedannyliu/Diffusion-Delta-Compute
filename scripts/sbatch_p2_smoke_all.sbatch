@@ -39,8 +39,22 @@ ENGINE=${ENGINE:-d2f}
 
 # spec: TASK:N_PROMPTS:PROFILE:RISK_DELTA:EXP
 declare -a DATASETS=(
-  "gsm8k:10:balanced:0.010:gsm8k_rule"
+  "gsm8k:1:balanced:0.010:gsm8k_rule"
 )
+
+# 指定要對標的 P1 teacher 輸出資料夾（供 quantiles 使用）
+P1_ROOT=${P1_ROOT:-/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251006_002834}
+if [[ -d "$P1_ROOT" ]]; then
+  # 選擇該資料夾底下最新一個 quantiles json
+  mapfile -t P1_Q < <(find "$P1_ROOT/runs" -maxdepth 1 -name 'teacher_quantiles_*.json' -print 2>/dev/null | LC_ALL=C sort)
+  if (( ${#P1_Q[@]} > 0 )); then
+    export QUANTILES_PATH="${P1_Q[-1]}"
+  else
+    echo "[P2] WARN: 在 $P1_ROOT/runs 找不到 teacher_quantiles_*.json；將讓程式自動 fallback。" >&2
+  fi
+else
+  echo "[P2] WARN: P1_ROOT=$P1_ROOT 不存在；將讓程式自動 fallback。" >&2
+fi
 
 echo "[sbatch] P2 smoke triplet starting (engine=${ENGINE})"
 for spec in "${DATASETS[@]}"; do
@@ -61,7 +75,7 @@ for spec in "${DATASETS[@]}"; do
     bash scripts/run_p2_rule_gate.sh "$CONFIG_PATH" \
       --engine "$ENGINE" \
       --task "$TASK" \
-      --num_prompts 5 \
+      --num_prompts 1 \
       --profile "$PROFILE" \
       --risk_delta "$RDELTA" \
       --budget_fraction 0.60 \

@@ -3,7 +3,7 @@
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
 #SBATCH --mem=80G
-#SBATCH -t 4:00:00
+#SBATCH -t 3:00:00
 #SBATCH -o logs/%x-%j.out
 
 # Prefer PyTorch wheel-bundled CUDA libs; keep module load but let our LD_LIBRARY_PATH take precedence later
@@ -40,7 +40,7 @@ CONFIG_PATH=${CONFIG_PATH:-configs/p1_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "gsm8k:200:gsm8k_smoke"
+  "gsm8k:100:gsm8k_smoke"
 )
 
 echo "[sbatch] P1 smoke triplet starting (engine=${ENGINE})"
