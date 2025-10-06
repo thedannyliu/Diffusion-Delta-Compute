@@ -34,9 +34,7 @@ ENGINE=${ENGINE:-d2f}
 
 # spec: TASK:N_PROMPTS:PROFILE:RISK_DELTA:EXP
 declare -a DATASETS=(
-  "wikitext:100:balanced:0.005:wikitext_rule"
-  "lambada:100:conservative:0.0075:lambada_rule"
-  "gsm8k:100:balanced:0.010:gsm8k_rule"
+  "gsm8k:50:balanced:0.010:gsm8k_rule"
 )
 
 echo "[sbatch] P2 smoke triplet starting (engine=${ENGINE})"

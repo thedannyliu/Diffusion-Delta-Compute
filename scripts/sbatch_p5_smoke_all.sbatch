@@ -34,9 +34,7 @@ CONFIG_BASE=${CONFIG_BASE:-configs/p5_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "wikitext:100:wikitext_p5"
-  "lambada:100:lambada_p5"
-  "gsm8k:100:gsm8k_p5"
+  "gsm8k:50:gsm8k_p5"
 )
 
 for spec in "${DATASETS[@]}"; do

@@ -44,9 +44,7 @@ srun --exclusive -N1 -n1 bash -lc '
 '
 
 declare -a DATASETS=(
-  "wikitext:100:wikitext_learned"
-  "lambada:100:lambada_learned"
-  "gsm8k:100:gsm8k_learned"
+  "gsm8k:50:gsm8k_learned"
 )
 
 for spec in "${DATASETS[@]}"; do

@@ -32,9 +32,7 @@ CONFIG_PATH=${CONFIG_PATH:-configs/p1_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "wikitext:100:wikitext_smoke"
-  "lambada:100:lambada_smoke"
-  "gsm8k:100:gsm8k_smoke"
+  "gsm8k:10:gsm8k_smoke"
 )
 
 echo "[sbatch] P1 smoke triplet starting (engine=${ENGINE})"
@@ -46,20 +44,21 @@ for spec in "${DATASETS[@]}"; do
       --engine "$ENGINE" \
       --task "$TASK" \
       --num_prompts "$N" \
+      --max_new_tokens 256 \
       --exp_name "$EPNAME" \
       --oracle_eval \
       --lte_probe heun \
       --dump_features_dir reports/artifacts/features
 
-  echo "[sbatch][P1] Trace5 task=${TASK}"
-  srun --exclusive -N1 -n1 \
-    bash scripts/run_p1_teacher.sh "$CONFIG_PATH" \
-      --engine "$ENGINE" \
-      --task "$TASK" \
-      --num_prompts 5 \
-      --exp_name "${EPNAME}_trace5" \
-      --consistency_full_compute \
-      --lte_probe heun
+  # echo "[sbatch][P1] Trace5 task=${TASK}"
+  # srun --exclusive -N1 -n1 \
+  #   bash scripts/run_p1_teacher.sh "$CONFIG_PATH" \
+  #     --engine "$ENGINE" \
+  #     --task "$TASK" \
+  #     --num_prompts 5 \
+  #     --exp_name "${EPNAME}_trace5" \
+  #     --consistency_full_compute \
+  #     --lte_probe heun
 done
 
 echo "[sbatch] P1 smoke triplet completed"

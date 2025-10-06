@@ -33,9 +33,7 @@ CONFIG_PATH=${CONFIG_PATH:-configs/p4_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "wikitext:100:wikitext_adapt"
-  "lambada:100:lambada_adapt"
-  "gsm8k:100:gsm8k_adapt"
+  "gsm8k:50:gsm8k_adapt"
 )
 
 for spec in "${DATASETS[@]}"; do

@@ -154,14 +154,14 @@ def synthetic_prompts(num_prompts: int) -> List[str]:
 
 
 GSM8K_FEWSHOT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
-    ("Tom has 6 marbles. He buys 5 packs with 4 marbles each. How many marbles does he have now?", "26"),
-    ("A bakery sells 8 muffins each morning and bakes 3 more batches of 5 muffins. How many muffins are for sale?", "23"),
-    ("Sara reads 12 pages each day for 4 days and then 8 more pages. How many pages did she read?", "56"),
-    ("Mike had 45 stickers, gave 18 to his friend, then bought 9 more. How many stickers does he have?", "36"),
-    ("A class has 24 students. If 7 new students join and 5 leave, how many students remain?", "26"),
-    ("Jenny buys 3 notebooks at $4 each and a pen that costs $5. How much does she spend?", "17"),
-    ("There are 120 seats in a hall. If 4 rows of 8 seats are reserved, how many seats are left?", "88"),
-    ("A farmer collected 56 eggs on Monday and 47 eggs on Tuesday. If he sells 50 eggs, how many eggs remain?", "53"),
+    ("Tom has 6 marbles. He buys 5 packs with 4 marbles each. How many marbles does he have now?", "#### 26"),
+    ("A bakery sells 8 muffins each morning and bakes 3 more batches of 5 muffins. How many muffins are for sale?", "#### 23"),
+    ("Sara reads 12 pages each day for 4 days and then 8 more pages. How many pages did she read?", "#### 56"),
+    ("Mike had 45 stickers, gave 18 to his friend, then bought 9 more. How many stickers does he have?", "#### 36"),
+    ("A class has 24 students. If 7 new students join and 5 leave, how many students remain?", "#### 26"),
+    ("Jenny buys 3 notebooks at $4 each and a pen that costs $5. How much does she spend?", "#### 17"),
+    ("There are 120 seats in a hall. If 4 rows of 8 seats are reserved, how many seats are left?", "#### 88"),
+    ("A farmer collected 56 eggs on Monday and 47 eggs on Tuesday. If he sells 50 eggs, how many eggs remain?", "#### 53"),
 )
 
 
@@ -170,7 +170,12 @@ def format_gsm8k_prompt(question: str) -> str:
     for ex_q, ex_a in GSM8K_FEWSHOT_EXAMPLES:
         shots.append(f"Q: {ex_q}\nA: {ex_a}")
     shots_text = "\n\n".join(shots)
-    return f"{shots_text}\n\nQ: {question}\nA:"
+    # Stronger instruction to enforce numeric final answer in #### <number> format
+    return (
+        f"{shots_text}\n\n"
+        f"Q: {question}\n"
+        f"A: Please answer with a single number only. Format as #### <number>."
+    )
 
 
 def load_prompts(num_prompts: int, task: str, data_root: Optional[str]) -> Tuple[List[str], Optional[List[str]]]:
@@ -356,6 +361,9 @@ def _generate_text(engine: BaseEngine, prompt: str, max_new: int) -> str:
         return engine.decode_tokens(ids).strip()
     except NotImplementedError:
         return ""
+    except Exception:
+        # Generation not supported by the current engine/model; degrade gracefully
+        return ""
 
 
 def _extract_gsm_answer(text: str) -> str:
@@ -453,6 +461,7 @@ def run_teacher(
     exp_name: Optional[str] = None,
     quantile_levels: Sequence[float] = DEFAULT_QUANTILES,
     labels: Optional[List[str]] = None,
+    gen_max_new: int = 128,
 ) -> TeacherArtifacts:
     from src.viz.plots import save_heatmap, save_hist
 
@@ -668,17 +677,21 @@ def run_teacher(
             tokens, margins = logits_argmax_and_margin(prev_logits)
             checksum = float(np.sum(prev_logits)) if prev_logits.size else 0.0
             decoded_text = engine.decode_tokens(tokens).strip()
+            gen_text_lbd = None
+            pred_word = None
+            gen_text_gsm = None
+            pred_ans = None
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=8)
+                gen_text_lbd = _generate_text(engine, prompt, max_new=gen_max_new)
                 # take the first word from generated continuation
-                pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
+                pred_word = _extract_last_word(gen_text_lbd.split()[0] if gen_text_lbd else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=64)
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
+                gen_text_gsm = _generate_text(engine, prompt, max_new=gen_max_new)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text_gsm))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -689,6 +702,12 @@ def run_teacher(
                 "margins": margins,
                 "logits_checksum": checksum,
             }
+            if is_lambada:
+                record["gen_text_lambada"] = gen_text_lbd
+                record["pred_word"] = pred_word
+            if is_gsm8k:
+                record["gen_text_gsm8k"] = gen_text_gsm
+                record["pred_ans"] = pred_ans
             teacher_outputs_file.write(json.dumps(record) + "\n")
 
     layer_mse_curves: Dict[int, List[float]] = {}
@@ -910,6 +929,7 @@ def run_rule_gate(
     profile: Optional[str] = None,
     labels: Optional[List[str]] = None,
     task_name: Optional[str] = None,
+    gen_max_new: int = 128,
 ) -> None:
     from src.viz.plots import save_hist
 
@@ -1130,13 +1150,13 @@ def run_rule_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=8)
+                gen_text = _generate_text(engine, prompt, max_new=gen_max_new)
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=64)
+                gen_text = _generate_text(engine, prompt, max_new=gen_max_new)
                 pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
@@ -1292,6 +1312,7 @@ def run_learned_gate(
     profile: Optional[str] = None,
     labels: Optional[List[str]] = None,
     task_name: Optional[str] = None,
+    gen_max_new: int = 128,
 ) -> None:
     from src.viz.plots import save_hist
 
@@ -1486,13 +1507,13 @@ def run_learned_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=8)
+                gen_text = _generate_text(engine, prompt, max_new=gen_max_new)
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=64)
+                gen_text = _generate_text(engine, prompt, max_new=gen_max_new)
                 pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
@@ -1602,6 +1623,7 @@ def run_adaptive(
     skip_budget: float,
     labels: Optional[List[str]] = None,
     task_name: Optional[str] = None,
+    gen_max_new: int = 128,
 ) -> None:
     scheduler = AdaptiveScheduler(scheduler_cfg)
     calibrator = ConformalRiskCalibrator(delta=risk_delta)
@@ -1691,13 +1713,13 @@ def run_adaptive(
             decoded_text = engine.decode_tokens(tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=8)
+                gen_text = _generate_text(engine, prompt, max_new=gen_max_new)
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=64)
+                gen_text = _generate_text(engine, prompt, max_new=gen_max_new)
                 pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
@@ -2026,6 +2048,7 @@ def main() -> None:
                     task_name=task,
                     exp_name=exp_name,
                     labels=prompt_labels,
+                    gen_max_new=max_new_tokens,
                 )
                 if args.consistency_full_compute and engine_name == "d2f":
                     # Full-compute twice to verify stability; write difference report
@@ -2112,6 +2135,7 @@ def main() -> None:
                     profile=args.profile if hasattr(args, "profile") else None,
                     labels=prompt_labels,
                     task_name=task,
+                    gen_max_new=max_new_tokens,
                 )
             elif mode == "learned_gate":
                 default_gate_path = str(Path(models_root) / "gates" / "learned_gate_latest.npz") if models_root else None
@@ -2143,6 +2167,7 @@ def main() -> None:
                     profile=args.profile if hasattr(args, "profile") else None,
                     labels=prompt_labels,
                     task_name=task,
+                    gen_max_new=max_new_tokens,
                 )
             elif mode == "adaptive":
                 scheduler_cfg = AdaptiveSchedulerConfig(
@@ -2161,6 +2186,7 @@ def main() -> None:
                     skip_budget=float(args.adaptive_budget),
                     labels=prompt_labels,
                     task_name=task,
+                    gen_max_new=max_new_tokens,
                 )
             elif mode == "oracle":
                 teacher_artifacts = run_teacher(

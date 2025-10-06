@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 import transformers.modeling_utils as _tfm_mu
 from peft import PeftModel
 
@@ -39,12 +39,20 @@ class D2FDreamEngine(BaseEngine):
             return _orig_from_pretrained.__func__(cls, *args, **kwargs)
         _tfm_mu.PreTrainedModel.from_pretrained = classmethod(_patched_from_pretrained)  # type: ignore
         try:
-            base_model = AutoModel.from_pretrained(
-                model_load_path,
-                device_map="auto" if self._device != "cpu" else None,
-                torch_dtype="auto",
-                trust_remote_code=True,
-            )
+            try:
+                base_model = AutoModelForCausalLM.from_pretrained(
+                    model_load_path,
+                    device_map="auto" if self._device != "cpu" else None,
+                    torch_dtype="auto",
+                    trust_remote_code=True,
+                )
+            except Exception:
+                base_model = AutoModel.from_pretrained(
+                    model_load_path,
+                    device_map="auto" if self._device != "cpu" else None,
+                    torch_dtype="auto",
+                    trust_remote_code=True,
+                )
         finally:
             _tfm_mu.PreTrainedModel.from_pretrained = _orig_from_pretrained  # restore
         if self._use_lora and self._lora_path:
@@ -54,6 +62,12 @@ class D2FDreamEngine(BaseEngine):
             except Exception:
                 base_model = peft_model
         self._model = base_model.eval()
+        # Infer vocab size for fallbacks
+        try:
+            self._vocab_size = int(getattr(self._tokenizer, "vocab_size", 0) or getattr(getattr(self._model, "config", None), "vocab_size", 0) or 32000)
+        except Exception:
+            self._vocab_size = 32000
+        self._fallback_proj: Optional[torch.Tensor] = None  # [hidden, vocab]
 
     def encode_prompt(self, prompt: str) -> EngineState:
         rng = np.random.default_rng(1234 + hash(prompt) % 10000)
@@ -118,11 +132,29 @@ class D2FDreamEngine(BaseEngine):
                     last_hidden = last_hidden.to(dtype=weight.dtype)
                 logits_t = oe(last_hidden)[0].detach().cpu().float().numpy()  # [seq, vocab]
         if logits_t is None:
-            # Fallback: simple projection
-            h_last = layers[-1]
-            vocab_size = 32000
-            proj = torch.randn((h_last.shape[-1], vocab_size), dtype=torch.float32)
-            logits_t = (torch.from_numpy(h_last) @ proj).numpy()
+            # Fallback: tie to input embeddings if present; else use a fixed random projection
+            try:
+                get_ie = getattr(self._model, "get_input_embeddings", None)
+                if callable(get_ie):
+                    ie = get_ie()
+                    w = getattr(ie, "weight", None)
+                    if w is not None:
+                        last_hidden = torch.from_numpy(layers[-1]).to(self._device)
+                        if last_hidden.ndim == 2:
+                            last_hidden = last_hidden.unsqueeze(0)
+                        last_hidden = last_hidden.to(dtype=w.dtype)
+                        logits_t = (last_hidden @ w.transpose(0, 1))[0].detach().cpu().float().numpy()
+            except Exception:
+                logits_t = None
+        if logits_t is None:
+            # Fixed projection seeded once per engine for stability
+            h_last = torch.from_numpy(layers[-1])  # [seq, hidden]
+            hidden = h_last.shape[-1]
+            if (self._fallback_proj is None) or (self._fallback_proj.shape[0] != hidden) or (self._fallback_proj.shape[1] != self._vocab_size):
+                gen = torch.Generator(device="cpu")
+                gen.manual_seed(12345)
+                self._fallback_proj = torch.randn((hidden, self._vocab_size), generator=gen, dtype=torch.float32)
+            logits_t = (h_last @ self._fallback_proj).numpy()
 
         # Apply per-token freeze by reusing previous step values where compute_mask is False
         if compute_mask is not None and state.prev_hidden_by_layer is not None and state.prev_logits is not None:
@@ -163,31 +195,60 @@ class D2FDreamEngine(BaseEngine):
         input_ids = inputs["input_ids"].to(self._device)
         attn_mask = inputs.get("attention_mask", None)
         if attn_mask is not None:
-            attn_mask = attn_mask.to(self._device).to(torch.bool)
+            attn_mask = attn_mask.to(self._device)
 
+        # Use native generate if available (CausalLM)
+        if hasattr(self._model, "generate"):
+            gen_kwargs = {
+                "max_new_tokens": int(max_new_tokens),
+                "do_sample": False,
+                "temperature": 0.0,
+                "eos_token_id": getattr(self._tokenizer, "eos_token_id", None),
+                "pad_token_id": getattr(self._tokenizer, "pad_token_id", getattr(self._tokenizer, "eos_token_id", None)),
+            }
+            try:
+                with torch.no_grad():
+                    out = self._model.generate(input_ids=input_ids, attention_mask=attn_mask, **{k: v for k, v in gen_kwargs.items() if v is not None})
+                orig_len = input_ids.shape[1]
+                new_tokens = out[0][orig_len:]
+                return [int(t.item()) for t in new_tokens]
+            except Exception:
+                # Fall through to manual greedy if this model doesn't truly support generate
+                pass
+
+        # Manual greedy loop using available heads
         gen_ids: List[int] = []
         get_oe = getattr(self._model, "get_output_embeddings", None)
-        if not callable(get_oe) or get_oe() is None:
-            return gen_ids  # no LM head available
-        lm_head = get_oe()
+        lm_head = get_oe() if callable(get_oe) else None
+        get_ie = getattr(self._model, "get_input_embeddings", None)
+        in_emb = get_ie() if callable(get_ie) else None
 
         for _ in range(int(max_new_tokens)):
             with torch.no_grad():
                 out = self._model(input_ids=input_ids, attention_mask=attn_mask, output_hidden_states=True)
                 last_hidden = out.hidden_states[-1][:, -1, :]  # [1, hidden]
-                # match dtype to head
-                weight = getattr(lm_head, "weight", None)
-                if weight is not None:
-                    last_hidden = last_hidden.to(dtype=weight.dtype)
-                logits = lm_head(last_hidden)  # [1, vocab]
+                if lm_head is not None:
+                    weight = getattr(lm_head, "weight", None)
+                    if weight is not None:
+                        last_hidden = last_hidden.to(dtype=weight.dtype)
+                    logits = lm_head(last_hidden)  # [1, vocab]
+                elif in_emb is not None and getattr(in_emb, "weight", None) is not None:
+                    w = in_emb.weight  # [vocab, hidden]
+                    last_hidden = last_hidden.to(dtype=w.dtype)
+                    logits = last_hidden @ w.transpose(0, 1)
+                else:
+                    hidden = last_hidden.shape[-1]
+                    if (self._fallback_proj is None) or (self._fallback_proj.shape[0] != hidden) or (self._fallback_proj.shape[1] != self._vocab_size):
+                        gen = torch.Generator(device="cpu")
+                        gen.manual_seed(12345)
+                        self._fallback_proj = torch.randn((hidden, self._vocab_size), generator=gen, dtype=torch.float32, device=last_hidden.device)
+                    logits = last_hidden @ self._fallback_proj
                 next_id = int(torch.argmax(logits[0]).item())
             gen_ids.append(next_id)
-            # append token
             next_token = torch.tensor([[next_id]], device=input_ids.device)
             input_ids = torch.cat([input_ids, next_token], dim=1)
             if attn_mask is not None:
-                attn_mask = torch.cat([attn_mask, torch.ones_like(next_token, dtype=torch.bool)], dim=1)
-            # early stop on EOS
+                attn_mask = torch.cat([attn_mask, torch.ones_like(next_token)], dim=1)
             eos_id = getattr(self._tokenizer, "eos_token_id", None)
             if eos_id is not None and next_id == int(eos_id):
                 break
