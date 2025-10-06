@@ -511,6 +511,7 @@ def run_teacher(
     dl2_rho = float(label_cfg.get("delta_l2_rho", 0.05))
     kl_max = float(label_cfg.get("kl_max", 0.01))
     timestamp = time.strftime("%Y%m%d_%H%M%S")
+    total_time_s = max(1e-6, time.time() - total_start)
     layer_step_mse: Dict[Tuple[int, int], List[float]] = defaultdict(list)
 
     metric_samples = {
@@ -1818,6 +1819,7 @@ def run_adaptive(
         "latency_ms_mean": float(np.mean(per_seq_latency_ms) if per_seq_latency_ms else 0.0),
         "latency_ms_p50": float(np.percentile(per_seq_latency_ms, 50) if per_seq_latency_ms else 0.0),
         "latency_ms_p90": float(np.percentile(per_seq_latency_ms, 90) if per_seq_latency_ms else 0.0),
+        "throughput_seq_per_s": float(len(prompts) / total_time_s),
         "skip_ratio_est_mean": float(np.mean(skip_estimates) if skip_estimates else 0.0),
         "skip_budget": float(skip_budget),
         "risk_delta": float(risk_delta),
