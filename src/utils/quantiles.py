@@ -100,10 +100,22 @@ class StepQuantileTable:
         if metric not in metric_entry:
             raise KeyError(f"Metric '{metric}' missing for step {step}")
         key = _format_quantile_key(float(quantile))
-        if key not in metric_entry[metric]:
-            available = ", ".join(sorted(metric_entry[metric].keys()))
-            raise KeyError(f"Quantile {quantile} missing for metric '{metric}' at step {step}; available: {available}")
-        return _safe_float(metric_entry[metric][key])
+        # Exact match first
+        if key in metric_entry[metric]:
+            return _safe_float(metric_entry[metric][key])
+        # Fallback: choose the nearest available quantile key by numeric distance.
+        # This makes the consumer robust to requesting 0.92 when only {0.90, 0.95} exist, etc.
+        candidates = []
+        for k in metric_entry[metric].keys():
+            try:
+                candidates.append((abs(float(k) - float(quantile)), k))
+            except Exception:
+                continue
+        if candidates:
+            _, nearest_key = min(candidates, key=lambda x: x[0])
+            return _safe_float(metric_entry[metric][nearest_key])
+        available = ", ".join(sorted(metric_entry[metric].keys()))
+        raise KeyError(f"Quantile {quantile} missing for metric '{metric}' at step {step}; available: {available}")
 
     @property
     def num_steps(self) -> Optional[int]:
@@ -131,4 +143,3 @@ def clip_sequence(values: Sequence[float], clip_min: Optional[float], clip_max: 
     if clip_min is None and clip_max is None:
         return list(float(v) for v in values)
     return [float(np.clip(v, clip_min if clip_min is not None else -math.inf, clip_max if clip_max is not None else math.inf)) for v in values]
-

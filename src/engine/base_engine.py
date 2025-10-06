@@ -49,3 +49,10 @@ class BaseEngine(ABC):
         """Decode a single token id into text."""
         return self.decode_tokens([token_id])
 
+    def greedy_generate(self, prompt: str, max_new_tokens: int = 16) -> List[int]:
+        """Greedy-generate token ids conditioned on the prompt.
+
+        Default implementation is not available; engines that support generation
+        (e.g., d2f backed by a causal LM head) should override this.
+        """
+        raise NotImplementedError("greedy_generate not implemented for this engine")

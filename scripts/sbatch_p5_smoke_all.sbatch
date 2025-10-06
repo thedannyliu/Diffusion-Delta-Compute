@@ -3,8 +3,8 @@
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
 #SBATCH -c 8
-#SBATCH --mem=40G
-#SBATCH -t 08:00:00
+#SBATCH --mem=80G
+#SBATCH -t 02:30:00
 #SBATCH -o logs/%x-%j.out
 
 module load cuda/12.1 || true
@@ -27,6 +27,11 @@ fi
 
 export PYTHON="${PYTHON:-$(command -v python)}"
 export WANDB_MODE=${WANDB_MODE:-online}
+export TRANSFORMERS_NO_TORCHVISION=1
+if [[ -n "$CONDA_PREFIX" ]]; then
+  NV_ROOT="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia"
+  export LD_LIBRARY_PATH="$NV_ROOT/nvjitlink/lib:$NV_ROOT/cublas/lib:$NV_ROOT/cusparse/lib:$NV_ROOT/cudnn/lib:$NV_ROOT/cusolver/lib:$NV_ROOT/cufft/lib:$NV_ROOT/curand/lib:$NV_ROOT/nvtx/lib:${LD_LIBRARY_PATH:-}"
+fi
 mkdir -p logs
 
 CONFIG_ORACLE=${CONFIG_ORACLE:-configs/p5_smoke.yaml}
@@ -34,9 +39,7 @@ CONFIG_BASE=${CONFIG_BASE:-configs/p5_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "wikitext:2000:wikitext_p5"
-  "lambada:2000:lambada_p5"
-  "gsm8k:1500:gsm8k_p5"
+  "gsm8k:200:gsm8k_p5"
 )
 
 for spec in "${DATASETS[@]}"; do
@@ -59,4 +62,3 @@ for spec in "${DATASETS[@]}"; do
 done
 
 echo "[sbatch] P5 smoke triplet completed"
-

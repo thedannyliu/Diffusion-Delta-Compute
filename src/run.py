@@ -18,7 +18,14 @@ from src.engine.mock_engine import MockDiffusionEngine
 
 try:  # Optional dependency, only needed when using the d2f backend
     from src.engine.d2f_engine import D2FDreamEngine
-except Exception:  # pragma: no cover - lazy import guard
+except Exception as _d2f_import_exc:  # pragma: no cover - lazy import guard
+    # Surface real import errors to logs so SLURM users can diagnose
+    try:
+        import sys, traceback
+        print(f"[d2f] Import failed: {_d2f_import_exc}", file=sys.stderr)
+        traceback.print_exc()
+    except Exception:
+        pass
     D2FDreamEngine = None
 from src.probes.metrics import (
     cosine_similarity_tokens,
@@ -153,6 +160,24 @@ def synthetic_prompts(num_prompts: int) -> List[str]:
     return prompts
 
 
+def format_gsm8k_prompt_cot(question: str) -> str:
+    """0-shot CoT style prompt for GSM8K.
+
+    We ask the model to think step by step, then produce the final numeric answer
+    strictly in the form '#### <number>' on a new last line. This matches our
+    answer extraction and Dream's recommended eval style.
+    """
+    instruction = (
+        "You are a helpful math assistant. Solve the problem step by step. "
+        "After the reasoning, output the final answer on a new last line in the exact format '#### <number>' without any extra text."
+    )
+    return (
+        f"{instruction}\n\n"
+        f"Q: {question}\n"
+        f"A: Let's think step by step."
+    )
+
+
 def load_prompts(num_prompts: int, task: str, data_root: Optional[str]) -> Tuple[List[str], Optional[List[str]]]:
     if task == "synthetic":
         return synthetic_prompts(num_prompts), None
@@ -163,7 +188,8 @@ def load_prompts(num_prompts: int, task: str, data_root: Optional[str]) -> Tuple
         return batch.texts, batch.labels
     if task == "gsm8k":
         batch = load_gsm8k_tiny(n_eval=num_prompts, data_root=data_root)
-        return batch.texts, batch.labels
+        formatted = [format_gsm8k_prompt_cot(q) for q in batch.texts]
+        return formatted, batch.labels
     raise ValueError(f"Unsupported task: {task}")
 
 
@@ -176,6 +202,10 @@ def ensure_dirs(out_dir: str) -> Dict[str, str]:
 
 
 def save_jsonl(path: str, rows: List[Dict]) -> None:
+    # Ensure parent directory exists to avoid race/cleanup issues
+    parent = os.path.dirname(path)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
@@ -276,22 +306,35 @@ def _accumulate_ppl(stats: Dict[str, float], logits: np.ndarray, input_ids: Sequ
     ids = np.asarray(input_ids, dtype=np.int64)
     if ids.ndim == 0:
         ids = ids.reshape(1)
-    mask = np.ones_like(ids, dtype=bool)
+    if logits.shape[0] <= 1 or ids.shape[0] <= 1:
+        return
+
+    ids_next = ids[1:]
+    logits_used = logits[:-1]
+    mask = np.ones_like(ids_next, dtype=bool)
+
     if pad_token_id is not None and pad_token_id != -1:
-        mask &= ids != int(pad_token_id)
+        mask &= ids_next != int(pad_token_id)
     if special_mask is not None:
         spec = np.asarray(special_mask, dtype=bool)
         if spec.shape == ids.shape:
-            mask &= ~spec
-    if not np.any(mask):
+            mask &= ~spec[1:]
+
+    valid_positions = np.nonzero(mask)[0]
+    if valid_positions.size == 0:
         return
-    logits = logits.astype(np.float64)
-    logits = logits - np.max(logits, axis=-1, keepdims=True)
-    log_probs = logits - np.log(np.sum(np.exp(logits), axis=-1, keepdims=True))
-    token_nll = -log_probs[np.arange(ids.shape[0]), ids]
-    selected = token_nll[mask]
-    stats["nll_sum"] = stats.get("nll_sum", 0.0) + float(np.sum(selected))
-    stats["token_count"] = stats.get("token_count", 0.0) + float(selected.shape[0])
+
+    target_ids = ids_next[valid_positions].astype(np.int64)
+    logits_valid = logits_used[valid_positions].astype(np.float64)
+    if logits_valid.ndim != 2 or logits_valid.shape[0] == 0:
+        return
+
+    logits_centered = logits_valid - np.max(logits_valid, axis=-1, keepdims=True)
+    log_probs = logits_centered - np.log(np.sum(np.exp(logits_centered), axis=-1, keepdims=True))
+    token_nll = -log_probs[np.arange(target_ids.shape[0]), target_ids]
+
+    stats["nll_sum"] = stats.get("nll_sum", 0.0) + float(np.sum(token_nll))
+    stats["token_count"] = stats.get("token_count", 0.0) + float(token_nll.shape[0])
 
 
 def _normalize_word(word: str) -> str:
@@ -301,6 +344,44 @@ def _normalize_word(word: str) -> str:
 def _extract_last_word(text: str) -> str:
     tokens = text.strip().split()
     return tokens[-1] if tokens else ""
+
+
+def _decode_last_token_text(logits: Optional[np.ndarray], engine: BaseEngine) -> str:
+    if logits is None or logits.ndim == 0 or logits.shape[0] == 0:
+        return ""
+    last_row = logits[-1]
+    if last_row.ndim == 0 or last_row.size == 0:
+        return ""
+    token_id = int(np.argmax(last_row))
+    try:
+        return engine.decode_tokens([token_id]).strip()
+    except NotImplementedError:
+        return ""
+
+
+def _generate_text(engine: BaseEngine, prompt: str, max_new: int) -> str:
+    try:
+        ids = engine.greedy_generate(prompt, max_new_tokens=max_new)
+        return engine.decode_tokens(ids).strip()
+    except NotImplementedError:
+        return ""
+    except Exception:
+        # Generation not supported by the current engine/model; degrade gracefully
+        return ""
+
+def _maybe_chat_wrap(engine: BaseEngine, prompt: str) -> str:
+    """If the engine supports chat templates (e.g., Dream Instruct), wrap the
+    raw prompt into a single-user chat turn so generation follows the
+    expected format. Otherwise return the prompt unchanged.
+    """
+    try:
+        # type: ignore[attr-defined]
+        apply_chat = getattr(engine, "apply_chat_template", None)
+        if callable(apply_chat):
+            return apply_chat([{"role": "user", "content": prompt}], add_generation_prompt=True)
+    except Exception:
+        pass
+    return prompt
 
 
 def _extract_gsm_answer(text: str) -> str:
@@ -398,6 +479,7 @@ def run_teacher(
     exp_name: Optional[str] = None,
     quantile_levels: Sequence[float] = DEFAULT_QUANTILES,
     labels: Optional[List[str]] = None,
+    gen_max_new: int = 128,
 ) -> TeacherArtifacts:
     from src.viz.plots import save_heatmap, save_hist
 
@@ -506,8 +588,8 @@ def run_teacher(
                 step_frac = obs.step_frac
                 dl2_norm = obs.delta_l2_norm
                 # Record oracle skip ratio independent of feature dumping
-                labels = ((cos >= cos_tau) & (dl2 <= dl2_rho) & (kl <= kl_max)).astype(np.float32)
-                oracle_ratios.append(float(np.mean(labels)))
+                oracle_mask = ((cos >= cos_tau) & (dl2 <= dl2_rho) & (kl <= kl_max)).astype(np.float32)
+                oracle_ratios.append(float(np.mean(oracle_mask)))
                 step_cos_means.append(float(np.mean(cos)))
                 step_dl2_means.append(float(np.mean(dl2)))
                 step_kl_means.append(float(np.mean(kl)))
@@ -520,10 +602,10 @@ def run_teacher(
                 metric_samples["delta_l2_norm"][t].append(dl2_norm)
                 metric_samples["kl"][t].append(kl)
                 step_token_counts[t] += int(cos.shape[0])
-                if stability_counter is None or stability_counter.shape[0] != labels.shape[0]:
-                    stability_counter = np.zeros_like(labels, dtype=np.int32)
-                    stability_max = np.zeros_like(labels, dtype=np.int32)
-                stable_mask = labels.astype(bool)
+                if stability_counter is None or stability_counter.shape[0] != oracle_mask.shape[0]:
+                    stability_counter = np.zeros_like(oracle_mask, dtype=np.int32)
+                    stability_max = np.zeros_like(oracle_mask, dtype=np.int32)
+                stable_mask = oracle_mask.astype(bool)
                 stability_counter[stable_mask] += 1
                 stability_counter[~stable_mask] = 0
                 if stability_max is not None:
@@ -577,8 +659,8 @@ def run_teacher(
                         axis=-1,
                     ).astype(np.float32)
                     feature_blocks.append(features.reshape(-1, features.shape[-1]))
-                    feature_labels.append(labels.reshape(-1))
-                    shape = labels.reshape(-1).shape
+                    feature_labels.append(oracle_mask.reshape(-1))
+                    shape = oracle_mask.reshape(-1).shape
                     meta = np.stack(
                         [
                             np.full(shape, prompt_idx, dtype=np.int32),
@@ -613,14 +695,23 @@ def run_teacher(
             tokens, margins = logits_argmax_and_margin(prev_logits)
             checksum = float(np.sum(prev_logits)) if prev_logits.size else 0.0
             decoded_text = engine.decode_tokens(tokens).strip()
+            gen_text_lbd = None
+            pred_word = None
+            gen_text_gsm = None
+            pred_ans = None
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                pred_word = _extract_last_word(decoded_text)
+                gen_prompt = _maybe_chat_wrap(engine, prompt)
+                gen_text_lbd = _generate_text(engine, gen_prompt, max_new=gen_max_new)
+                # take the first word from generated continuation
+                pred_word = _extract_last_word(gen_text_lbd.split()[0] if gen_text_lbd else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                gen_prompt = _maybe_chat_wrap(engine, prompt)
+                gen_text_gsm = _generate_text(engine, gen_prompt, max_new=gen_max_new)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text_gsm))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -631,6 +722,12 @@ def run_teacher(
                 "margins": margins,
                 "logits_checksum": checksum,
             }
+            if is_lambada:
+                record["gen_text_lambada"] = gen_text_lbd
+                record["pred_word"] = pred_word
+            if is_gsm8k:
+                record["gen_text_gsm8k"] = gen_text_gsm
+                record["pred_ans"] = pred_ans
             teacher_outputs_file.write(json.dumps(record) + "\n")
 
     layer_mse_curves: Dict[int, List[float]] = {}
@@ -852,6 +949,7 @@ def run_rule_gate(
     profile: Optional[str] = None,
     labels: Optional[List[str]] = None,
     task_name: Optional[str] = None,
+    gen_max_new: int = 128,
 ) -> None:
     from src.viz.plots import save_hist
 
@@ -1072,12 +1170,14 @@ def run_rule_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                pred_word = _extract_last_word(decoded_text)
+                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -1232,6 +1332,7 @@ def run_learned_gate(
     profile: Optional[str] = None,
     labels: Optional[List[str]] = None,
     task_name: Optional[str] = None,
+    gen_max_new: int = 128,
 ) -> None:
     from src.viz.plots import save_hist
 
@@ -1307,8 +1408,6 @@ def run_learned_gate(
             computed_tokens = seq_len if mask_to_use is None else int(np.sum(mask_to_use))
             total_tokens_computed += computed_tokens
             total_tokens_possible += seq_len
-            if seq_len > 0:
-                freeze_ratios_by_step[t].append(1.0 - (computed_tokens / float(seq_len)))
 
             obs = compute_token_observables(
                 out.hidden_by_layer,
@@ -1322,6 +1421,8 @@ def run_learned_gate(
             risk_scores = compute_risk_score(obs.cosine_norm, obs.delta_l2_norm, obs.kl)
 
             watchdog_mask = (obs.cosine < watchdog_min_cos) | (obs.kl > watchdog_max_kl)
+            # Snapshot before any potential reset so decision logs reflect the initial watchdog state
+            watchdog_mask_snapshot = watchdog_mask.copy()
             if np.any(watchdog_mask):
                 calibrator.register(step=t, scores=risk_scores, unsafe_mask=watchdog_mask)
                 mask_to_use = None
@@ -1340,6 +1441,10 @@ def run_learned_gate(
             computed_tokens = out.logits.shape[0] if mask_to_use is None else int(np.sum(mask_to_use))
             total_tokens_computed += computed_tokens
             total_tokens_possible += out.logits.shape[0]
+            # Track freeze ratio per step after compute mask is finalized
+            seq_len = out.logits.shape[0]
+            if seq_len > 0:
+                freeze_ratios_by_step[t].append(1.0 - (computed_tokens / float(seq_len)))
 
             # Use raw features to match training FEATURE_NAMES[:7]
             features = np.stack(
@@ -1426,12 +1531,14 @@ def run_learned_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                pred_word = _extract_last_word(decoded_text)
+                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -1540,6 +1647,7 @@ def run_adaptive(
     skip_budget: float,
     labels: Optional[List[str]] = None,
     task_name: Optional[str] = None,
+    gen_max_new: int = 128,
 ) -> None:
     scheduler = AdaptiveScheduler(scheduler_cfg)
     calibrator = ConformalRiskCalibrator(delta=risk_delta)
@@ -1629,12 +1737,14 @@ def run_adaptive(
             decoded_text = engine.decode_tokens(tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                pred_word = _extract_last_word(decoded_text)
+                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
         nominal_steps = float(num_steps)
@@ -1921,6 +2031,8 @@ def main() -> None:
         model_path = coalesce(args.model_path, cfg.get("model_path"), default_model_path)
         lora_path = coalesce(args.lora_path, cfg.get("lora_path"), default_lora_path)
         use_lora = bool(args.use_d2f_lora or cfg.get("use_d2f_lora", False))
+        # Allow a longer prompt context to avoid truncating few-shot/chat templates
+        prompt_max_len = 2048
         engine = D2FDreamEngine(
             model_name="d2f-small",
             device="cuda",
@@ -1929,6 +2041,7 @@ def main() -> None:
             use_lora=use_lora,
             num_steps=num_steps,
             max_seq_len=max_new_tokens,
+            prompt_max_len=prompt_max_len,
         )
         # Pass layer reuse cadence into engine (optional)
         try:
@@ -1962,6 +2075,7 @@ def main() -> None:
                     task_name=task,
                     exp_name=exp_name,
                     labels=prompt_labels,
+                    gen_max_new=max_new_tokens,
                 )
                 if args.consistency_full_compute and engine_name == "d2f":
                     # Full-compute twice to verify stability; write difference report
@@ -1995,10 +2109,25 @@ def main() -> None:
                     if cos_quantile_level is None or delta_quantile_level is None:
                         raise ValueError("Stepwise thresholds require one_minus_cos_quantile and delta_l2_quantile")
                     table = StepQuantileTable.load(quantiles_path)
-                    available_steps = table.num_steps if table.num_steps is not None else num_steps
-                    step_count = min(num_steps, int(available_steps))
-                    raw_one_minus_cos = [table.value("one_minus_cos", step, cos_quantile_level) for step in range(step_count)]
-                    raw_delta = [table.value("delta_l2_norm", step, delta_quantile_level) for step in range(step_count)]
+                    # Robust handling: quantile tables often start at step=1 since step=0 has no previous state.
+                    # Build thresholds for steps [0..num_steps-1] by copying from the nearest available step when missing.
+                    step_keys_present = sorted(int(k) for k in table.steps.keys())
+                    if not step_keys_present:
+                        raise ValueError(f"No steps present in quantiles file: {quantiles_path}")
+                    max_available = max(step_keys_present)
+                    step_count = min(num_steps, int(table.num_steps) if table.num_steps is not None else (max_available + 1))
+
+                    def _nearest_step(s: int) -> int:
+                        if s in step_keys_present:
+                            return s
+                        # choose nearest lower step; if none, use smallest present
+                        lower = [k for k in step_keys_present if k <= s]
+                        if lower:
+                            return max(lower)
+                        return step_keys_present[0]
+
+                    raw_one_minus_cos = [table.value("one_minus_cos", _nearest_step(step), cos_quantile_level) for step in range(step_count)]
+                    raw_delta = [table.value("delta_l2_norm", _nearest_step(step), delta_quantile_level) for step in range(step_count)]
                     one_minus_cos_vals = clip_sequence(raw_one_minus_cos, clip_min, clip_max)
                     delta_vals = clip_sequence(raw_delta, clip_min, clip_max)
                     if stepwise_ema is not None:
@@ -2014,7 +2143,7 @@ def main() -> None:
                         source_path=quantiles_path,
                     )
                     if kl_quantile_level is not None:
-                        kl_values = [table.value("kl", step, kl_quantile_level) for step in range(step_count)]
+                        kl_values = [table.value("kl", _nearest_step(step), kl_quantile_level) for step in range(step_count)]
                         kl_values = clip_sequence(kl_values, clip_min, clip_max)
                         if stepwise_ema is not None:
                             kl_values = apply_ema(kl_values, stepwise_ema)
@@ -2048,6 +2177,7 @@ def main() -> None:
                     profile=args.profile if hasattr(args, "profile") else None,
                     labels=prompt_labels,
                     task_name=task,
+                    gen_max_new=max_new_tokens,
                 )
             elif mode == "learned_gate":
                 default_gate_path = str(Path(models_root) / "gates" / "learned_gate_latest.npz") if models_root else None
@@ -2079,6 +2209,7 @@ def main() -> None:
                     profile=args.profile if hasattr(args, "profile") else None,
                     labels=prompt_labels,
                     task_name=task,
+                    gen_max_new=max_new_tokens,
                 )
             elif mode == "adaptive":
                 scheduler_cfg = AdaptiveSchedulerConfig(
@@ -2097,6 +2228,7 @@ def main() -> None:
                     skip_budget=float(args.adaptive_budget),
                     labels=prompt_labels,
                     task_name=task,
+                    gen_max_new=max_new_tokens,
                 )
             elif mode == "oracle":
                 teacher_artifacts = run_teacher(

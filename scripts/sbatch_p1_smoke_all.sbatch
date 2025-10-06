@@ -2,10 +2,11 @@
 #SBATCH -J dcllm_p1_smoke_all
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
-#SBATCH --mem=40G
-#SBATCH -t 12:00:00
+#SBATCH --mem=80G
+#SBATCH -t 3:00:00
 #SBATCH -o logs/%x-%j.out
 
+# Prefer PyTorch wheel-bundled CUDA libs; keep module load but let our LD_LIBRARY_PATH take precedence later
 module load cuda/12.1 || true
 
 CONDA_ROOT=${CONDA_ROOT:-$HOME/miniconda3}
@@ -26,15 +27,20 @@ fi
 
 export PYTHON="${PYTHON:-$(command -v python)}"
 export WANDB_MODE=${WANDB_MODE:-online}
+# Skip torchvision entirely to avoid import-time issues in transformers
+export TRANSFORMERS_NO_TORCHVISION=1
+# Ensure PyTorch wheel CUDA libs are first in search path to avoid symbol mismatches (e.g., __nvJitLinkComplete_12_4)
+if [[ -n "$CONDA_PREFIX" ]]; then
+  NV_ROOT="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia"
+  export LD_LIBRARY_PATH="$NV_ROOT/nvjitlink/lib:$NV_ROOT/cublas/lib:$NV_ROOT/cusparse/lib:$NV_ROOT/cudnn/lib:$NV_ROOT/cusolver/lib:$NV_ROOT/cufft/lib:$NV_ROOT/curand/lib:$NV_ROOT/nvtx/lib:${LD_LIBRARY_PATH:-}"
+fi
 mkdir -p logs
 
 CONFIG_PATH=${CONFIG_PATH:-configs/p1_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "wikitext:2000:wikitext_smoke"
-  "lambada:2000:lambada_smoke"
-  "gsm8k:1500:gsm8k_smoke"
+  "gsm8k:100:gsm8k_smoke"
 )
 
 echo "[sbatch] P1 smoke triplet starting (engine=${ENGINE})"
@@ -46,21 +52,21 @@ for spec in "${DATASETS[@]}"; do
       --engine "$ENGINE" \
       --task "$TASK" \
       --num_prompts "$N" \
+      --max_new_tokens 256 \
       --exp_name "$EPNAME" \
       --oracle_eval \
       --lte_probe heun \
       --dump_features_dir reports/artifacts/features
 
-  echo "[sbatch][P1] Trace5 task=${TASK}"
-  srun --exclusive -N1 -n1 \
-    bash scripts/run_p1_teacher.sh "$CONFIG_PATH" \
-      --engine "$ENGINE" \
-      --task "$TASK" \
-      --num_prompts 5 \
-      --exp_name "${EPNAME}_trace5" \
-      --consistency_full_compute \
-      --lte_probe heun
+  # echo "[sbatch][P1] Trace5 task=${TASK}"
+  # srun --exclusive -N1 -n1 \
+  #   bash scripts/run_p1_teacher.sh "$CONFIG_PATH" \
+  #     --engine "$ENGINE" \
+  #     --task "$TASK" \
+  #     --num_prompts 5 \
+  #     --exp_name "${EPNAME}_trace5" \
+  #     --consistency_full_compute \
+  #     --lte_probe heun
 done
 
 echo "[sbatch] P1 smoke triplet completed"
-

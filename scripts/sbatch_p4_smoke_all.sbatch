@@ -3,8 +3,8 @@
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
 #SBATCH -c 8
-#SBATCH --mem=40G
-#SBATCH -t 12:00:00
+#SBATCH --mem=80G
+#SBATCH -t 02:30:00
 #SBATCH -o logs/%x-%j.out
 
 module load cuda/12.1 || true
@@ -27,15 +27,18 @@ fi
 
 export PYTHON="${PYTHON:-$(command -v python)}"
 export WANDB_MODE=${WANDB_MODE:-online}
+export TRANSFORMERS_NO_TORCHVISION=1
+if [[ -n "$CONDA_PREFIX" ]]; then
+  NV_ROOT="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia"
+  export LD_LIBRARY_PATH="$NV_ROOT/nvjitlink/lib:$NV_ROOT/cublas/lib:$NV_ROOT/cusparse/lib:$NV_ROOT/cudnn/lib:$NV_ROOT/cusolver/lib:$NV_ROOT/cufft/lib:$NV_ROOT/curand/lib:$NV_ROOT/nvtx/lib:${LD_LIBRARY_PATH:-}"
+fi
 mkdir -p logs
 
 CONFIG_PATH=${CONFIG_PATH:-configs/p4_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "wikitext:2000:wikitext_adapt"
-  "lambada:2000:lambada_adapt"
-  "gsm8k:1500:gsm8k_adapt"
+  "gsm8k:200:gsm8k_adapt"
 )
 
 for spec in "${DATASETS[@]}"; do
@@ -55,11 +58,10 @@ for spec in "${DATASETS[@]}"; do
     bash scripts/run_p4_adaptive.sh "$CONFIG_PATH" \
       --engine "$ENGINE" \
       --task "$TASK" \
-      --num_prompts 5 \
+      --num_prompts 200 \
       --exp_name "${EPNAME}_trace5" \
       --lte_probe heun \
       --lte_eps 0.015 --lte_min_consec 2 --max_stride 4 --adaptive_budget 0.20
 done
 
 echo "[sbatch] P4 smoke triplet completed"
-
