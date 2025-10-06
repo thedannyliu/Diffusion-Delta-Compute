@@ -29,6 +29,7 @@ logs/
 reports_0929/
 reports_quick/
 
+reports.zip
 # Notebooks
 .ipynb_checkpoints/
 
