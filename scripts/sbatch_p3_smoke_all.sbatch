@@ -27,6 +27,11 @@ fi
 
 export PYTHON="${PYTHON:-$(command -v python)}"
 export WANDB_MODE=${WANDB_MODE:-online}
+export TRANSFORMERS_NO_TORCHVISION=1
+if [[ -n "$CONDA_PREFIX" ]]; then
+  NV_ROOT="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia"
+  export LD_LIBRARY_PATH="$NV_ROOT/nvjitlink/lib:$NV_ROOT/cublas/lib:$NV_ROOT/cusparse/lib:$NV_ROOT/cudnn/lib:$NV_ROOT/cusolver/lib:$NV_ROOT/cufft/lib:$NV_ROOT/curand/lib:$NV_ROOT/nvtx/lib:${LD_LIBRARY_PATH:-}"
+fi
 mkdir -p logs models/gates
 
 CONFIG_PATH=${CONFIG_PATH:-configs/p3_smoke.yaml}
@@ -44,7 +49,7 @@ srun --exclusive -N1 -n1 bash -lc '
 '
 
 declare -a DATASETS=(
-  "gsm8k:50:gsm8k_learned"
+  "gsm8k:200:gsm8k_learned"
 )
 
 for spec in "${DATASETS[@]}"; do

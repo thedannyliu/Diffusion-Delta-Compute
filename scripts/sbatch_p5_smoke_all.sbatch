@@ -27,6 +27,11 @@ fi
 
 export PYTHON="${PYTHON:-$(command -v python)}"
 export WANDB_MODE=${WANDB_MODE:-online}
+export TRANSFORMERS_NO_TORCHVISION=1
+if [[ -n "$CONDA_PREFIX" ]]; then
+  NV_ROOT="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia"
+  export LD_LIBRARY_PATH="$NV_ROOT/nvjitlink/lib:$NV_ROOT/cublas/lib:$NV_ROOT/cusparse/lib:$NV_ROOT/cudnn/lib:$NV_ROOT/cusolver/lib:$NV_ROOT/cufft/lib:$NV_ROOT/curand/lib:$NV_ROOT/nvtx/lib:${LD_LIBRARY_PATH:-}"
+fi
 mkdir -p logs
 
 CONFIG_ORACLE=${CONFIG_ORACLE:-configs/p5_smoke.yaml}
@@ -34,7 +39,7 @@ CONFIG_BASE=${CONFIG_BASE:-configs/p5_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "gsm8k:50:gsm8k_p5"
+  "gsm8k:200:gsm8k_p5"
 )
 
 for spec in "${DATASETS[@]}"; do

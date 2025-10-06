@@ -40,7 +40,7 @@ CONFIG_PATH=${CONFIG_PATH:-configs/p1_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "gsm8k:10:gsm8k_smoke"
+  "gsm8k:200:gsm8k_smoke"
 )
 
 echo "[sbatch] P1 smoke triplet starting (engine=${ENGINE})"
