@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:h100:1
 #SBATCH -c 8
 #SBATCH --mem=80G
-#SBATCH -t 01:00:00
+#SBATCH -t 02:30:00
 #SBATCH -o logs/%x-%j.out
 
 module load cuda/12.1 || true
@@ -39,7 +39,7 @@ CONFIG_BASE=${CONFIG_BASE:-configs/p5_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 
 declare -a DATASETS=(
-  "gsm8k:1:gsm8k_p5"
+  "gsm8k:200:gsm8k_p5"
 )
 
 for spec in "${DATASETS[@]}"; do
