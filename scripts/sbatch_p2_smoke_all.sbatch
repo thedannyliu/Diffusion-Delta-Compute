@@ -56,6 +56,8 @@ else
   echo "[P2] WARN: P1_ROOT=$P1_ROOT 不存在；將讓程式自動 fallback。" >&2
 fi
 
+DATA_ROOT=${DATA_ROOT:-}
+
 echo "[sbatch] P2 smoke triplet starting (engine=${ENGINE})"
 for spec in "${DATASETS[@]}"; do
   IFS=':' read -r TASK N PROFILE RDELTA EPNAME <<<"$spec"
@@ -65,6 +67,8 @@ for spec in "${DATASETS[@]}"; do
       --engine "$ENGINE" \
       --task "$TASK" \
       --num_prompts "$N" \
+      ${DATA_ROOT:+--data_root "$DATA_ROOT"} \
+      --max_new_tokens 256 \
       --profile "$PROFILE" \
       --risk_delta "$RDELTA" \
       --budget_fraction 0.60 \
@@ -76,6 +80,8 @@ for spec in "${DATASETS[@]}"; do
       --engine "$ENGINE" \
       --task "$TASK" \
       --num_prompts 200 \
+      ${DATA_ROOT:+--data_root "$DATA_ROOT"} \
+      --max_new_tokens 256 \
       --profile "$PROFILE" \
       --risk_delta "$RDELTA" \
       --budget_fraction 0.60 \

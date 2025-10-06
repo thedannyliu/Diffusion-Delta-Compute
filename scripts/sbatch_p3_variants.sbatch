@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J dcllm_p3_smoke_all
+#SBATCH -J dcllm_p3_variants
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
 #SBATCH -c 8
@@ -39,10 +39,11 @@ ENGINE=${ENGINE:-d2f}
 WEIGHTS_OUT=${WEIGHTS_OUT:-models/gates/learned_gate_latest.npz}
 # 指定 P1 teacher 輸出根目錄（供 features 使用）
 P1_ROOT=${P1_ROOT:-/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251006_002834}
+# 可選資料根目錄（統一樣本/標註）
 DATA_ROOT=${DATA_ROOT:-}
 
-# Train once using P1 features, then evaluate per dataset.
-echo "[sbatch] P3 training learned gate from P1 features under: ${P1_ROOT}"
+# 先訓練一次 learned gate 權重（使用 P1 的 features）
+echo "[sbatch][P3-variants] Train learned gate from P1 features under: ${P1_ROOT}"
 srun --exclusive -N1 -n1 bash -lc '
   set -euo pipefail
   PYTHON=${PYTHON:-python}
@@ -53,34 +54,36 @@ srun --exclusive -N1 -n1 bash -lc '
   "$PYTHON" -m src.learned.train_gate --features "${F[-1]}" --out "'"$WEIGHTS_OUT"'" --epochs "${TRAIN_EPOCHS:-8}" --batch_size "${TRAIN_BATCH:-1024}" --lr "${TRAIN_LR:-1e-3}"
 '
 
-declare -a DATASETS=(
-  "gsm8k:200:gsm8k_learned"
+# 單一資料集（與 P1/P4/P5 對齊）
+TASK=${TASK:-gsm8k}
+N_PROMPTS=${N_PROMPTS:-200}
+
+# Variants: NAME:THRESHOLD:FREEZE_K:MIN_CONSEC:BUDGET:RISK_DELTA
+declare -a VARIANTS=(
+  "cons:0.70:1:2:0.60:0.015"
+  "bal:0.50:2:1:0.60:0.010"
+  "aggr:0.30:3:1:0.50:0.008"
 )
 
-for spec in "${DATASETS[@]}"; do
-  IFS=':' read -r TASK N EPNAME <<<"$spec"
-  echo "[sbatch][P3] Eval task=${TASK} n=${N}"
+for spec in "${VARIANTS[@]}"; do
+  IFS=':' read -r VNAME THRESH K MINC BUDGET RDELTA <<<"$spec"
+  EXP_NAME="gsm8k_learned_${VNAME}"
+  echo "[sbatch][P3-variants] Eval ${VNAME} task=${TASK} n=${N_PROMPTS} thr=${THRESH} K=${K} minc=${MINC} budget=${BUDGET} δ=${RDELTA}"
   srun --exclusive -N1 -n1 \
     "$PYTHON" -m src.run --mode learned_gate --config "$CONFIG_PATH" \
       --engine "$ENGINE" \
       --learned_gate_weights "$WEIGHTS_OUT" \
+      --learned_gate_threshold "$THRESH" \
+      --learned_gate_freeze_K "$K" \
+      --learned_gate_min_consecutive "$MINC" \
       --task "$TASK" \
       ${DATA_ROOT:+--data_root "$DATA_ROOT"} \
       --max_new_tokens 256 \
-      --num_prompts "$N" \
-      --exp_name "$EPNAME"
-
-  echo "[sbatch][P3] Trace5 task=${TASK}"
-  srun --exclusive -N1 -n1 \
-    "$PYTHON" -m src.run --mode learned_gate --config "$CONFIG_PATH" \
-      --engine "$ENGINE" \
-      --learned_gate_weights "$WEIGHTS_OUT" \
-      --task "$TASK" \
-      ${DATA_ROOT:+--data_root "$DATA_ROOT"} \
-      --max_new_tokens 256 \
-      --num_prompts 200 \
-      --consistency_check \
-      --exp_name "${EPNAME}_trace5"
+      --num_prompts "$N_PROMPTS" \
+      --risk_delta "$RDELTA" \
+      --budget_fraction "$BUDGET" \
+      --exp_name "$EXP_NAME"
 done
 
-echo "[sbatch] P3 smoke triplet completed"
+echo "[sbatch] P3 variants completed"
+

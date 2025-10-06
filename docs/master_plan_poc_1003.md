@@ -271,8 +271,9 @@ Five detailed samples (trace):
 
 Common settings
 - Engine: d2f unless noted; use_d2f_lora=false initially.
-- Steps/tokens: num_steps=12, max_new_tokens=128 (match P1/P2 configs).
-- Outputs: reports/ (auto-structured by phase/mode/engine/exp_name).
+- Steps/tokens: num_steps=12, max_new_tokens=256（統一與 P1/P4/P5 對齊）。
+- Outputs: reports/（依 phase/mode/engine/exp_name 自動分層）。
+- Data root 對齊：可設定 `DATA_ROOT=/path/to/data` 以固定 prompts/labels（例如 `DATA_ROOT/.../gsm8k/test.jsonl`）。
 
 Dataset sizes (Tier A)
 - Wikitext-2: --task wikitext --num_prompts 2000
@@ -285,15 +286,15 @@ Run commands (local, example)
   - Trace 5: python -m src.run --mode teacher --config configs/p1_smoke.yaml --task wikitext --num_prompts 5 --consistency_full_compute --exp_name wikitext_trace5
   - Repeat for lambada (2000) and gsm8k (1500).
 - P2 Rule gate (risk + budget):
-  - Wikitext: python -m src.run --mode rule_gate --config configs/p2_smoke.yaml --task wikitext --num_prompts 2000 --profile balanced --risk_delta 0.005 --budget_fraction 0.60 --risk_initial_quantile 0.60 --risk_low_support 50
+  - Wikitext: python -m src.run --mode rule_gate --config configs/p2_smoke.yaml --task wikitext --num_prompts 2000 --max_new_tokens 256 --profile balanced --risk_delta 0.005 --budget_fraction 0.60 --risk_initial_quantile 0.60 --risk_low_support 50
   - Trace 5: add --num_prompts 5 --consistency_check --exp_name wikitext_rule_trace5
-  - LAMBADA: use --profile conservative --risk_delta 0.0075; GSM8K: balanced, 0.010.
+  - LAMBADA: use --profile conservative --risk_delta 0.0075; GSM8K: balanced, 0.010。
 - P3 Learned gate (train+eval):
   - Train from latest P1 features: scripts/sbatch_p3_learned_gate.sbatch (auto-discovery) or python -m src.learned.train_gate --features reports/artifacts/features/teacher_features_*.npz --out models/gates/learned_gate_latest.npz
   - Eval: python -m src.run --mode learned_gate --config configs/p3_smoke.yaml --task wikitext --num_prompts 2000 --learned_gate_weights models/gates/learned_gate_latest.npz
   - Trace 5: add --num_prompts 5 --consistency_check --exp_name wikitext_learned_trace5
 - P4 Adaptive:
-  - python -m src.run --mode adaptive --config configs/p4_smoke.yaml --task wikitext --num_prompts 2000 --lte_probe heun --lte_eps 0.015 --lte_min_consec 2 --max_stride 4 --adaptive_budget 0.20
+  - python -m src.run --mode adaptive --config configs/p4_smoke.yaml --task wikitext --num_prompts 2000 --max_new_tokens 256 --lte_probe heun --lte_eps 0.015 --lte_min_consec 2 --max_stride 4 --adaptive_budget 0.20
   - Trace 5: add --num_prompts 5 --exp_name wikitext_adapt_trace5
 - P5 Oracle & baselines:
   - Oracle: scripts/sbatch_p5_oracle.sbatch with CONFIG_PATH=configs/p5_smoke.yaml and per-dataset overrides (see wrappers below).
@@ -318,6 +319,47 @@ The repository now includes wrappers that launch Wikitext-2, LAMBADA-open, and T
 - scripts/sbatch_p3_smoke_all.sbatch
 - scripts/sbatch_p4_smoke_all.sbatch
 - scripts/sbatch_p5_smoke_all.sbatch
+
+附加（保守/變體）
+- scripts/sbatch_p4_conservative.sbatch（更保守的 P4：`lte_eps=0.010, lte_min_consec=3, max_stride=3, --adaptive_hard_budget`）
+- scripts/sbatch_p3_variants.sbatch（一次跑多組 learned gate 門檻/凍結設定）
+
+All P2–P5 sbatch wrappers now support `DATA_ROOT`（固定資料來源）與 `--max_new_tokens 256` 預設；時間上限調整為 `02:30:00`，預設樣本數為 200。
+
+如需與 P1 對齊 P2/P3 的門檻/特徵來源，亦可設定：
+- P1_ROOT 指向既有 P1 輸出（P2 會自動尋找 `runs/teacher_quantiles_*.json`，P3 訓練會抓 `reports/artifacts/features/teacher_features_*.npz`）。
+
+範例（以 gsm8k 為例）
+```bash
+export DATA_ROOT=/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/data
+export P1_ROOT=/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251006_002834
+
+# P5 teacher（對齊 P1）
+sbatch scripts/sbatch_p5_smoke_all.sbatch
+
+# P4 adaptive（原設定、保守設定）
+sbatch scripts/sbatch_p4_smoke_all.sbatch
+sbatch scripts/sbatch_p4_conservative.sbatch
+
+# P2 rule gate（使用 P1 quantiles）
+sbatch scripts/sbatch_p2_smoke_all.sbatch
+
+# P3 learned gate（P1 features 訓練 + 評估）
+sbatch scripts/sbatch_p3_smoke_all.sbatch
+sbatch scripts/sbatch_p3_variants.sbatch
+```
+
+Implementation updates（2025-10-06）
+- 程式修復
+  - Quantiles：`StepQuantileTable.value()` 若請求分位數不存在（如 0.92），自動回退到「最近的可用分位數」，避免 KeyError。
+  - P2 step-wise 門檻：當 quantiles 缺少某步（常見 step=0），對每個 step 採「最接近的可用 step」回退。
+  - P3 learned_gate：修正 `watchdog_mask_snapshot` 未定義；凍結比率記錄順序修正。
+  - P4 adaptive：新增 `--adaptive_hard_budget`，可把 skip_budget 當硬上限，必要時將 stride 強制降為 1。
+- sbatch 與執行腳本
+  - P2–P5：將 `#SBATCH -t` 統一改為 `02:30:00`、預設樣本數為 200；支援 `DATA_ROOT` 與 `--max_new_tokens 256` 對齊 P1。
+  - P2：自動從 `P1_ROOT` 取用最新 quantiles；trace 段亦對齊資料與 tokens。
+  - P3：訓練使用 `P1_ROOT` 下最新 features，並提供 `scripts/sbatch_p3_variants.sbatch` 進行門檻/凍結參數掃描。
+  - P4：新增 `scripts/sbatch_p4_conservative.sbatch`（保守設定 + 硬上限），並於 run wrapper 支援 `HARD_BUDGET`。
 - scripts/sbatch_p1_smoke_quick.sbatch  # 3-sample sanity run to validate cluster setup
 
 Usage examples
