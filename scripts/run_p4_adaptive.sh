@@ -19,6 +19,9 @@ LTE_EPS=${LTE_EPS:-}
 LTE_MIN_CONSEC=${LTE_MIN_CONSEC:-}
 MAX_STRIDE=${MAX_STRIDE:-}
 ADAPTIVE_BUDGET=${ADAPTIVE_BUDGET:-}
+DATA_ROOT=${DATA_ROOT:-}
+MAX_NEW=${MAX_NEW:-}
+HARD_BUDGET=${HARD_BUDGET:-}
 
 CLI_ARGS=("--mode" "adaptive" "--config" "$CONFIG_PATH")
 if [[ -n "$ENGINE" ]]; then
@@ -47,6 +50,15 @@ if [[ -n "$MAX_STRIDE" ]]; then
 fi
 if [[ -n "$ADAPTIVE_BUDGET" ]]; then
   CLI_ARGS+=("--adaptive_budget" "$ADAPTIVE_BUDGET")
+fi
+if [[ -n "$DATA_ROOT" ]]; then
+  CLI_ARGS+=("--data_root" "$DATA_ROOT")
+fi
+if [[ -n "$MAX_NEW" ]]; then
+  CLI_ARGS+=("--max_new_tokens" "$MAX_NEW")
+fi
+if [[ -n "$HARD_BUDGET" ]]; then
+  CLI_ARGS+=("--adaptive_hard_budget")
 fi
 
 CLI_ARGS+=("$@")

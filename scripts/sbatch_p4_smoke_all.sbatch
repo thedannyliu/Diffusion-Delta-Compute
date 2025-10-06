@@ -36,6 +36,7 @@ mkdir -p logs
 
 CONFIG_PATH=${CONFIG_PATH:-configs/p4_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
+DATA_ROOT=${DATA_ROOT:-}
 
 declare -a DATASETS=(
   "gsm8k:200:gsm8k_adapt"
@@ -45,6 +46,7 @@ for spec in "${DATASETS[@]}"; do
   IFS=':' read -r TASK N EPNAME <<<"$spec"
   echo "[sbatch][P4] Full run task=${TASK} n=${N}"
   srun --exclusive -N1 -n1 \
+    env ${DATA_ROOT:+DATA_ROOT="$DATA_ROOT"} MAX_NEW=256 \
     bash scripts/run_p4_adaptive.sh "$CONFIG_PATH" \
       --engine "$ENGINE" \
       --task "$TASK" \
@@ -55,6 +57,7 @@ for spec in "${DATASETS[@]}"; do
 
   echo "[sbatch][P4] Trace5 task=${TASK}"
   srun --exclusive -N1 -n1 \
+    env ${DATA_ROOT:+DATA_ROOT="$DATA_ROOT"} MAX_NEW=256 \
     bash scripts/run_p4_adaptive.sh "$CONFIG_PATH" \
       --engine "$ENGINE" \
       --task "$TASK" \

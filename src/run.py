@@ -128,6 +128,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptive_budget", type=float, default=0.20, help="Adaptive total skip budget")
     parser.add_argument("--sprt_alpha", type=float, default=0.005, help="SPRT Type I error")
     parser.add_argument("--sprt_beta", type=float, default=0.005, help="SPRT Type II error")
+    parser.add_argument("--adaptive_hard_budget", action="store_true", help="Enforce skip_budget as a hard cap in adaptive mode")
     return parser.parse_args()
 
 
@@ -1645,6 +1646,7 @@ def run_adaptive(
     scheduler_cfg: AdaptiveSchedulerConfig,
     risk_delta: float,
     skip_budget: float,
+    hard_budget: bool = False,
     labels: Optional[List[str]] = None,
     task_name: Optional[str] = None,
     gen_max_new: int = 128,
@@ -1719,6 +1721,18 @@ def run_adaptive(
             prompt_stride.append(scheduler.stride)
             prompt_lte_thresholds.append(lte_threshold)
             stride = scheduler.stride
+            # Optional hard cap on cumulative skip ratio per sequence
+            if hard_budget and (t + 1) > 0:
+                eff_next = effective_steps + (1.0 / max(1, stride))
+                skip_so_far = 1.0 - (eff_next / float(t + 1))
+                if skip_so_far > skip_budget:
+                    stride = 1
+                    # reflect the correction in recorded stride and internal state
+                    prompt_stride[-1] = 1
+                    try:
+                        scheduler._current_stride = 1  # best-effort sync
+                    except Exception:
+                        pass
             effective_steps += 1.0 / max(1, stride)
 
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
@@ -2226,6 +2240,7 @@ def main() -> None:
                     scheduler_cfg=scheduler_cfg,
                     risk_delta=risk_delta,
                     skip_budget=float(args.adaptive_budget),
+                    hard_budget=bool(args.adaptive_hard_budget),
                     labels=prompt_labels,
                     task_name=task,
                     gen_max_new=max_new_tokens,
