@@ -5,8 +5,14 @@ from typing import Dict, List, Optional, Sequence
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
-import transformers.modeling_utils as _tfm_mu
-from peft import PeftModel
+try:
+    import transformers.modeling_utils as _tfm_mu  # type: ignore
+except Exception:  # pragma: no cover - transformers internals may change
+    _tfm_mu = None  # type: ignore
+try:
+    from peft import PeftModel  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    PeftModel = None  # type: ignore
 
 from .base_engine import BaseEngine, EngineState, StepOutputs
 
@@ -18,7 +24,17 @@ class D2FDreamEngine(BaseEngine):
     If the package is not installed, an ImportError will be raised.
     """
 
-    def __init__(self, model_name: str = "d2f-small", device: str = "cuda", model_path: Optional[str] = None, lora_path: Optional[str] = None, use_lora: bool = False, num_steps: int = 12, max_seq_len: int = 128) -> None:
+    def __init__(
+        self,
+        model_name: str = "d2f-small",
+        device: str = "cuda",
+        model_path: Optional[str] = None,
+        lora_path: Optional[str] = None,
+        use_lora: bool = False,
+        num_steps: int = 12,
+        max_seq_len: int = 128,
+        prompt_max_len: Optional[int] = None,
+    ) -> None:
         self._device = device if torch.cuda.is_available() and device.startswith("cuda") else "cpu"
         if self._device == "cpu":
             print("[warn] CUDA not available; D2F engine is running on CPU. GPU utilization will be ~0.", flush=True)
@@ -27,17 +43,21 @@ class D2FDreamEngine(BaseEngine):
         self._lora_path = lora_path
         self._use_lora = use_lora
         self._num_steps = num_steps
-        self._seq_len = max_seq_len
+        self._seq_len = max_seq_len  # legacy: kept for backward compat, used as new-token cap in some fallbacks
+        # A larger context window for prompt encoding to avoid truncating few-shot/chat templates
+        self._prompt_max_len = int(prompt_max_len) if prompt_max_len is not None else 2048
 
         # Load tokenizer and model from local snapshot
         model_load_path = self._model_path if self._model_path else "Dream-org/Dream-v0-Instruct-7B"
         self._tokenizer = AutoTokenizer.from_pretrained(model_load_path, trust_remote_code=True)
         # Patch transformers to drop 'weights_only' kwarg that some remote models don't accept
-        _orig_from_pretrained = _tfm_mu.PreTrainedModel.from_pretrained
-        def _patched_from_pretrained(cls, *args, **kwargs):
-            kwargs.pop("weights_only", None)
-            return _orig_from_pretrained.__func__(cls, *args, **kwargs)
-        _tfm_mu.PreTrainedModel.from_pretrained = classmethod(_patched_from_pretrained)  # type: ignore
+        _orig_from_pretrained = None
+        if _tfm_mu is not None and hasattr(_tfm_mu, "PreTrainedModel"):
+            _orig_from_pretrained = _tfm_mu.PreTrainedModel.from_pretrained  # type: ignore[attr-defined]
+            def _patched_from_pretrained(cls, *args, **kwargs):
+                kwargs.pop("weights_only", None)
+                return _orig_from_pretrained.__func__(cls, *args, **kwargs)  # type: ignore
+            _tfm_mu.PreTrainedModel.from_pretrained = classmethod(_patched_from_pretrained)  # type: ignore
         try:
             try:
                 base_model = AutoModelForCausalLM.from_pretrained(
@@ -54,13 +74,16 @@ class D2FDreamEngine(BaseEngine):
                     trust_remote_code=True,
                 )
         finally:
-            _tfm_mu.PreTrainedModel.from_pretrained = _orig_from_pretrained  # restore
+            if _orig_from_pretrained is not None and _tfm_mu is not None and hasattr(_tfm_mu, "PreTrainedModel"):
+                _tfm_mu.PreTrainedModel.from_pretrained = _orig_from_pretrained  # type: ignore[attr-defined]
         if self._use_lora and self._lora_path:
-            peft_model = PeftModel.from_pretrained(base_model, self._lora_path)
+            if PeftModel is None:
+                raise ImportError("peft is required for LoRA. Please `pip install peft`." )
+            peft_model = PeftModel.from_pretrained(base_model, self._lora_path)  # type: ignore[misc]
             try:
-                base_model = peft_model.merge_and_unload()
+                base_model = peft_model.merge_and_unload()  # type: ignore[attr-defined]
             except Exception:
-                base_model = peft_model
+                base_model = peft_model  # type: ignore[assignment]
         self._model = base_model.eval()
         # Infer vocab size for fallbacks
         try:
@@ -69,12 +92,35 @@ class D2FDreamEngine(BaseEngine):
             self._vocab_size = 32000
         self._fallback_proj: Optional[torch.Tensor] = None  # [hidden, vocab]
 
+    # Expose chat template formatting so callers can prepare prompts correctly
+    def apply_chat_template(self, messages: List[Dict[str, str]], add_generation_prompt: bool = True) -> str:
+        try:
+            # Prefer tokenizer-native chat template rendering as text
+            return self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+            )
+        except Exception:
+            # Fallback: very simple role formatting
+            out: List[str] = []
+            for m in messages:
+                role = m.get("role", "user").strip().lower()
+                content = m.get("content", "")
+                if role == "user":
+                    out.append(f"User: {content}")
+                else:
+                    out.append(f"Assistant: {content}")
+            if add_generation_prompt:
+                out.append("Assistant:")
+            return "\n".join(out)
+
     def encode_prompt(self, prompt: str) -> EngineState:
         rng = np.random.default_rng(1234 + hash(prompt) % 10000)
         return EngineState(prompt=prompt, step_index=0, rng=rng)
 
     def step(self, state: EngineState, t: int, compute_mask: Optional[np.ndarray] = None) -> StepOutputs:
-        inputs = self._tokenizer(state.prompt, return_tensors="pt", truncation=True, max_length=self._seq_len)
+        inputs = self._tokenizer(state.prompt, return_tensors="pt", truncation=True, max_length=self._prompt_max_len)
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
         if "attention_mask" in inputs:
             inputs["attention_mask"] = inputs["attention_mask"].to(torch.bool)
@@ -191,11 +237,35 @@ class D2FDreamEngine(BaseEngine):
 
     def greedy_generate(self, prompt: str, max_new_tokens: int = 16) -> List[int]:
         # Encode prompt ids
-        inputs = self._tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self._seq_len)
+        inputs = self._tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self._prompt_max_len)
         input_ids = inputs["input_ids"].to(self._device)
         attn_mask = inputs.get("attention_mask", None)
         if attn_mask is not None:
             attn_mask = attn_mask.to(self._device)
+
+        # Prefer the Dream diffusion_generate API if available
+        if hasattr(self._model, "diffusion_generate"):
+            try:
+                with torch.no_grad():
+                    out = self._model.diffusion_generate(
+                        input_ids,
+                        attention_mask=attn_mask,
+                        max_new_tokens=int(max_new_tokens),
+                        steps=int(max_new_tokens),
+                        # dtype intentionally omitted; rely on model default
+                        temperature=0.1,
+                        top_p=0.9,
+                        alg="entropy",
+                        return_dict_in_generate=True,
+                        output_history=False,
+                    )
+                seq = out.sequences[0]
+                orig_len = input_ids.shape[1]
+                new_tokens = seq[orig_len:]
+                return [int(t.item()) for t in new_tokens]
+            except Exception:
+                # If diffusion_generate fails, fall back to next strategies
+                pass
 
         # Use native generate if available (CausalLM)
         if hasattr(self._model, "generate"):

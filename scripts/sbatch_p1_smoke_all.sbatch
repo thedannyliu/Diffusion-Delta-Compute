@@ -6,6 +6,7 @@
 #SBATCH -t 4:00:00
 #SBATCH -o logs/%x-%j.out
 
+# Prefer PyTorch wheel-bundled CUDA libs; keep module load but let our LD_LIBRARY_PATH take precedence later
 module load cuda/12.1 || true
 
 CONDA_ROOT=${CONDA_ROOT:-$HOME/miniconda3}
@@ -26,6 +27,13 @@ fi
 
 export PYTHON="${PYTHON:-$(command -v python)}"
 export WANDB_MODE=${WANDB_MODE:-online}
+# Skip torchvision entirely to avoid import-time issues in transformers
+export TRANSFORMERS_NO_TORCHVISION=1
+# Ensure PyTorch wheel CUDA libs are first in search path to avoid symbol mismatches (e.g., __nvJitLinkComplete_12_4)
+if [[ -n "$CONDA_PREFIX" ]]; then
+  NV_ROOT="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia"
+  export LD_LIBRARY_PATH="$NV_ROOT/nvjitlink/lib:$NV_ROOT/cublas/lib:$NV_ROOT/cusparse/lib:$NV_ROOT/cudnn/lib:$NV_ROOT/cusolver/lib:$NV_ROOT/cufft/lib:$NV_ROOT/curand/lib:$NV_ROOT/nvtx/lib:${LD_LIBRARY_PATH:-}"
+fi
 mkdir -p logs
 
 CONFIG_PATH=${CONFIG_PATH:-configs/p1_smoke.yaml}

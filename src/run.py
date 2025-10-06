@@ -18,7 +18,14 @@ from src.engine.mock_engine import MockDiffusionEngine
 
 try:  # Optional dependency, only needed when using the d2f backend
     from src.engine.d2f_engine import D2FDreamEngine
-except Exception:  # pragma: no cover - lazy import guard
+except Exception as _d2f_import_exc:  # pragma: no cover - lazy import guard
+    # Surface real import errors to logs so SLURM users can diagnose
+    try:
+        import sys, traceback
+        print(f"[d2f] Import failed: {_d2f_import_exc}", file=sys.stderr)
+        traceback.print_exc()
+    except Exception:
+        pass
     D2FDreamEngine = None
 from src.probes.metrics import (
     cosine_similarity_tokens,
@@ -153,28 +160,21 @@ def synthetic_prompts(num_prompts: int) -> List[str]:
     return prompts
 
 
-GSM8K_FEWSHOT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
-    ("Tom has 6 marbles. He buys 5 packs with 4 marbles each. How many marbles does he have now?", "#### 26"),
-    ("A bakery sells 8 muffins each morning and bakes 3 more batches of 5 muffins. How many muffins are for sale?", "#### 23"),
-    ("Sara reads 12 pages each day for 4 days and then 8 more pages. How many pages did she read?", "#### 56"),
-    ("Mike had 45 stickers, gave 18 to his friend, then bought 9 more. How many stickers does he have?", "#### 36"),
-    ("A class has 24 students. If 7 new students join and 5 leave, how many students remain?", "#### 26"),
-    ("Jenny buys 3 notebooks at $4 each and a pen that costs $5. How much does she spend?", "#### 17"),
-    ("There are 120 seats in a hall. If 4 rows of 8 seats are reserved, how many seats are left?", "#### 88"),
-    ("A farmer collected 56 eggs on Monday and 47 eggs on Tuesday. If he sells 50 eggs, how many eggs remain?", "#### 53"),
-)
+def format_gsm8k_prompt_cot(question: str) -> str:
+    """0-shot CoT style prompt for GSM8K.
 
-
-def format_gsm8k_prompt(question: str) -> str:
-    shots = []
-    for ex_q, ex_a in GSM8K_FEWSHOT_EXAMPLES:
-        shots.append(f"Q: {ex_q}\nA: {ex_a}")
-    shots_text = "\n\n".join(shots)
-    # Stronger instruction to enforce numeric final answer in #### <number> format
+    We ask the model to think step by step, then produce the final numeric answer
+    strictly in the form '#### <number>' on a new last line. This matches our
+    answer extraction and Dream's recommended eval style.
+    """
+    instruction = (
+        "You are a helpful math assistant. Solve the problem step by step. "
+        "After the reasoning, output the final answer on a new last line in the exact format '#### <number>' without any extra text."
+    )
     return (
-        f"{shots_text}\n\n"
+        f"{instruction}\n\n"
         f"Q: {question}\n"
-        f"A: Please answer with a single number only. Format as #### <number>."
+        f"A: Let's think step by step."
     )
 
 
@@ -188,7 +188,7 @@ def load_prompts(num_prompts: int, task: str, data_root: Optional[str]) -> Tuple
         return batch.texts, batch.labels
     if task == "gsm8k":
         batch = load_gsm8k_tiny(n_eval=num_prompts, data_root=data_root)
-        formatted = [format_gsm8k_prompt(q) for q in batch.texts]
+        formatted = [format_gsm8k_prompt_cot(q) for q in batch.texts]
         return formatted, batch.labels
     raise ValueError(f"Unsupported task: {task}")
 
@@ -202,6 +202,10 @@ def ensure_dirs(out_dir: str) -> Dict[str, str]:
 
 
 def save_jsonl(path: str, rows: List[Dict]) -> None:
+    # Ensure parent directory exists to avoid race/cleanup issues
+    parent = os.path.dirname(path)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row) + "\n")
@@ -364,6 +368,20 @@ def _generate_text(engine: BaseEngine, prompt: str, max_new: int) -> str:
     except Exception:
         # Generation not supported by the current engine/model; degrade gracefully
         return ""
+
+def _maybe_chat_wrap(engine: BaseEngine, prompt: str) -> str:
+    """If the engine supports chat templates (e.g., Dream Instruct), wrap the
+    raw prompt into a single-user chat turn so generation follows the
+    expected format. Otherwise return the prompt unchanged.
+    """
+    try:
+        # type: ignore[attr-defined]
+        apply_chat = getattr(engine, "apply_chat_template", None)
+        if callable(apply_chat):
+            return apply_chat([{"role": "user", "content": prompt}], add_generation_prompt=True)
+    except Exception:
+        pass
+    return prompt
 
 
 def _extract_gsm_answer(text: str) -> str:
@@ -570,8 +588,8 @@ def run_teacher(
                 step_frac = obs.step_frac
                 dl2_norm = obs.delta_l2_norm
                 # Record oracle skip ratio independent of feature dumping
-                labels = ((cos >= cos_tau) & (dl2 <= dl2_rho) & (kl <= kl_max)).astype(np.float32)
-                oracle_ratios.append(float(np.mean(labels)))
+                oracle_mask = ((cos >= cos_tau) & (dl2 <= dl2_rho) & (kl <= kl_max)).astype(np.float32)
+                oracle_ratios.append(float(np.mean(oracle_mask)))
                 step_cos_means.append(float(np.mean(cos)))
                 step_dl2_means.append(float(np.mean(dl2)))
                 step_kl_means.append(float(np.mean(kl)))
@@ -584,10 +602,10 @@ def run_teacher(
                 metric_samples["delta_l2_norm"][t].append(dl2_norm)
                 metric_samples["kl"][t].append(kl)
                 step_token_counts[t] += int(cos.shape[0])
-                if stability_counter is None or stability_counter.shape[0] != labels.shape[0]:
-                    stability_counter = np.zeros_like(labels, dtype=np.int32)
-                    stability_max = np.zeros_like(labels, dtype=np.int32)
-                stable_mask = labels.astype(bool)
+                if stability_counter is None or stability_counter.shape[0] != oracle_mask.shape[0]:
+                    stability_counter = np.zeros_like(oracle_mask, dtype=np.int32)
+                    stability_max = np.zeros_like(oracle_mask, dtype=np.int32)
+                stable_mask = oracle_mask.astype(bool)
                 stability_counter[stable_mask] += 1
                 stability_counter[~stable_mask] = 0
                 if stability_max is not None:
@@ -641,8 +659,8 @@ def run_teacher(
                         axis=-1,
                     ).astype(np.float32)
                     feature_blocks.append(features.reshape(-1, features.shape[-1]))
-                    feature_labels.append(labels.reshape(-1))
-                    shape = labels.reshape(-1).shape
+                    feature_labels.append(oracle_mask.reshape(-1))
+                    shape = oracle_mask.reshape(-1).shape
                     meta = np.stack(
                         [
                             np.full(shape, prompt_idx, dtype=np.int32),
@@ -683,14 +701,16 @@ def run_teacher(
             pred_ans = None
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text_lbd = _generate_text(engine, prompt, max_new=gen_max_new)
+                gen_prompt = _maybe_chat_wrap(engine, prompt)
+                gen_text_lbd = _generate_text(engine, gen_prompt, max_new=gen_max_new)
                 # take the first word from generated continuation
                 pred_word = _extract_last_word(gen_text_lbd.split()[0] if gen_text_lbd else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text_gsm = _generate_text(engine, prompt, max_new=gen_max_new)
+                gen_prompt = _maybe_chat_wrap(engine, prompt)
+                gen_text_gsm = _generate_text(engine, gen_prompt, max_new=gen_max_new)
                 pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text_gsm))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
@@ -1150,13 +1170,13 @@ def run_rule_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=gen_max_new)
+                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=gen_max_new)
+                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
                 pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
@@ -1507,13 +1527,13 @@ def run_learned_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=gen_max_new)
+                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=gen_max_new)
+                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
                 pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
@@ -1713,13 +1733,13 @@ def run_adaptive(
             decoded_text = engine.decode_tokens(tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=gen_max_new)
+                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, prompt, max_new=gen_max_new)
+                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
                 pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
@@ -2007,6 +2027,8 @@ def main() -> None:
         model_path = coalesce(args.model_path, cfg.get("model_path"), default_model_path)
         lora_path = coalesce(args.lora_path, cfg.get("lora_path"), default_lora_path)
         use_lora = bool(args.use_d2f_lora or cfg.get("use_d2f_lora", False))
+        # Allow a longer prompt context to avoid truncating few-shot/chat templates
+        prompt_max_len = 2048
         engine = D2FDreamEngine(
             model_name="d2f-small",
             device="cuda",
@@ -2015,6 +2037,7 @@ def main() -> None:
             use_lora=use_lora,
             num_steps=num_steps,
             max_seq_len=max_new_tokens,
+            prompt_max_len=prompt_max_len,
         )
         # Pass layer reuse cadence into engine (optional)
         try:
