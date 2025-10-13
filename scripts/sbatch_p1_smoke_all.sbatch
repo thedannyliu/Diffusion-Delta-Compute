@@ -41,7 +41,7 @@ ENGINE=${ENGINE:-d2f}
 DATA_ROOT=${DATA_ROOT:-}
 
 declare -a DATASETS=(
-  "gsm8k:100:gsm8k_smoke"
+  "gsm8k:50:gsm8k_smoke"
 )
 
 echo "[sbatch] P1 smoke triplet starting (engine=${ENGINE})"

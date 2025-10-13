@@ -36,3 +36,7 @@ reports.zip
 # OS
 .DS_Store
 Thumbs.db
+
+# Ignore generated reports and archives
+reports/
+*.zip
