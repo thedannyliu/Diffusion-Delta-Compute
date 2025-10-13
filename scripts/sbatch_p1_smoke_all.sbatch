@@ -32,12 +32,13 @@ export TRANSFORMERS_NO_TORCHVISION=1
 # Ensure PyTorch wheel CUDA libs are first in search path to avoid symbol mismatches (e.g., __nvJitLinkComplete_12_4)
 if [[ -n "$CONDA_PREFIX" ]]; then
   NV_ROOT="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia"
-  export LD_LIBRARY_PATH="$NV_ROOT/nvjitlink/lib:$NV_ROOT/cublas/lib:$NV_ROOT/cusparse/lib:$NV_ROOT/cudnn/lib:$NV_ROOT/cusolver/lib:$NV_ROOT/cufft/lib:$NV_ROOT/curand/lib:$NV_ROOT/nvtx/lib:${LD_LIBRARY_PATH:-}"
+  export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$NV_ROOT/nvjitlink/lib:$NV_ROOT/cublas/lib:$NV_ROOT/cusparse/lib:$NV_ROOT/cudnn/lib:$NV_ROOT/cusolver/lib:$NV_ROOT/cufft/lib:$NV_ROOT/curand/lib:$NV_ROOT/nvtx/lib:${LD_LIBRARY_PATH:-}"
 fi
 mkdir -p logs
 
 CONFIG_PATH=${CONFIG_PATH:-configs/p1_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
+DATA_ROOT=${DATA_ROOT:-}
 
 declare -a DATASETS=(
   "gsm8k:100:gsm8k_smoke"
@@ -52,6 +53,7 @@ for spec in "${DATASETS[@]}"; do
       --engine "$ENGINE" \
       --task "$TASK" \
       --num_prompts "$N" \
+      ${DATA_ROOT:+--data_root "$DATA_ROOT"} \
       --max_new_tokens 256 \
       --exp_name "$EPNAME" \
       --oracle_eval \
@@ -63,7 +65,7 @@ for spec in "${DATASETS[@]}"; do
   #   bash scripts/run_p1_teacher.sh "$CONFIG_PATH" \
   #     --engine "$ENGINE" \
   #     --task "$TASK" \
-  #     --num_prompts 5 \
+  #     --num_prompts "$N" \
   #     --exp_name "${EPNAME}_trace5" \
   #     --consistency_full_compute \
   #     --lte_probe heun

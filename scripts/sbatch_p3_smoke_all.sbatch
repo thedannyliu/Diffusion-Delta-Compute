@@ -54,7 +54,7 @@ srun --exclusive -N1 -n1 bash -lc '
 '
 
 declare -a DATASETS=(
-  "gsm8k:200:gsm8k_learned"
+  "gsm8k:1000:gsm8k_learned"
 )
 
 for spec in "${DATASETS[@]}"; do
@@ -78,7 +78,7 @@ for spec in "${DATASETS[@]}"; do
       --task "$TASK" \
       ${DATA_ROOT:+--data_root "$DATA_ROOT"} \
       --max_new_tokens 256 \
-      --num_prompts 200 \
+      --num_prompts "$N" \
       --consistency_check \
       --exp_name "${EPNAME}_trace5"
 done

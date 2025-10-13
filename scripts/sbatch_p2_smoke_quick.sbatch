@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH -J dcllm_p1_smoke_quick
+#SBATCH -J dcllm_p2_smoke_quick
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
-#SBATCH --mem=80G
-#SBATCH -t 00:30:00
+#SBATCH --mem=60G
+#SBATCH -t 01:30:00
 #SBATCH -o logs/%x-%j.out
 
 module load cuda/12.1 || true
@@ -29,30 +29,35 @@ export WANDB_MODE=${WANDB_MODE:-disabled}
 export TRANSFORMERS_NO_TORCHVISION=1
 if [[ -n "$CONDA_PREFIX" ]]; then
   NV_ROOT="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia"
-  export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$NV_ROOT/nvjitlink/lib:$NV_ROOT/cublas/lib:$NV_ROOT/cusparse/lib:$NV_ROOT/cudnn/lib:$NV_ROOT/cusolver/lib:$NV_ROOT/cufft/lib:$NV_ROOT/curand/lib:$NV_ROOT/nvtx/lib:${LD_LIBRARY_PATH:-}"
+  export LD_LIBRARY_PATH="$NV_ROOT/nvjitlink/lib:$NV_ROOT/cublas/lib:$NV_ROOT/cusparse/lib:$NV_ROOT/cudnn/lib:$NV_ROOT/cusolver/lib:$NV_ROOT/cufft/lib:$NV_ROOT/curand/lib:$NV_ROOT/nvtx/lib:${LD_LIBRARY_PATH:-}"
 fi
 mkdir -p logs
 
-CONFIG_PATH=${CONFIG_PATH:-configs/p1_smoke.yaml}
+CONFIG_PATH=${CONFIG_PATH:-configs/p2_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 OUT_DIR=${OUT_DIR:-reports_quick}
+DATA_ROOT=${DATA_ROOT:-}
 
+# spec: TASK:PROFILE:RISK_DELTA:EXP_NAME
 declare -a DATASETS=(
-  "wikitext:wikitext_smoke_quick"
-  "lambada:lambada_smoke_quick"
-  "gsm8k:gsm8k_smoke_quick"
+  "gsm8k:balanced:0.010:gsm8k_rule_quick"
 )
 
+echo "[sbatch] P2 quick smoke starting (engine=${ENGINE})"
 for spec in "${DATASETS[@]}"; do
-  IFS=':' read -r TASK EPNAME <<<"$spec"
-  echo "[sbatch][P1-quick] task=${TASK}"
+  IFS=':' read -r TASK PROFILE RDELTA EPNAME <<<"$spec"
+  echo "[sbatch][P2-quick] task=${TASK} profile=${PROFILE} δ=${RDELTA}"
   srun --exclusive -N1 -n1 \
-    bash scripts/run_p1_teacher.sh "$CONFIG_PATH" \
+    env OUT_DIR="$OUT_DIR" PROFILES_CSV="$PROFILE" ${DATA_ROOT:+DATA_ROOT="$DATA_ROOT"} \
+    bash scripts/run_p2_rule_gate.sh "$CONFIG_PATH" \
       --engine "$ENGINE" \
       --task "$TASK" \
-      --num_prompts 3 \
-      --out_dir "$OUT_DIR" \
-      --exp_name "${EPNAME}" \
-      --lte_probe heun
-
+      --num_prompts 5 \
+      ${DATA_ROOT:+--data_root "$DATA_ROOT"} \
+      --max_new_tokens 128 \
+      --risk_delta "$RDELTA" \
+      --budget_fraction 0.60 \
+      --exp_name "$EPNAME"
 done
+
+echo "[sbatch] P2 quick smoke completed"

@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -532,6 +532,7 @@ def run_teacher(
     lambada_total = len(labels) if is_lambada and labels is not None else 0
     gsm_correct = 0
     gsm_total = len(labels) if is_gsm8k and labels is not None else 0
+    first_prompt_step_trace: List[Dict[str, Any]] = []
 
     for prompt_idx, prompt in enumerate(prompts):
         state = engine.encode_prompt(prompt)
@@ -552,6 +553,8 @@ def run_teacher(
 
         seq_start = time.time()
         final_aux: Optional[Dict] = None
+        capture_trace = prompt_idx == 0
+        prompt_step_trace: List[Dict[str, Any]] = []
         for t in range(num_steps):
             out = engine.step(state, t)
             # Immediate GPU sample after a GPU-heavy op to avoid missing short spikes
@@ -560,6 +563,13 @@ def run_teacher(
             except Exception:
                 pass
             final_aux = out.aux if isinstance(out.aux, dict) else None
+            step_tokens, _ = logits_argmax_and_margin(out.logits)
+            try:
+                step_decoded = engine.decode_tokens(step_tokens).strip()
+            except Exception:
+                step_decoded = ""
+            oracle_skip_fraction: Optional[float] = None
+            oracle_skip_indices: Optional[List[int]] = None
             if prev_hidden is not None and prev_logits is not None:
                 # Build valid mask (exclude padding and special tokens)
                 valid_mask: Optional[np.ndarray] = None
@@ -630,6 +640,9 @@ def run_teacher(
                         dl2_layer = dl2_layer[valid_mask]
                     layer_step_values_cos[(li, t)] = cos_layer
                     layer_step_values_dl2[(li, t)] = dl2_layer
+                oracle_mask_bool = oracle_mask.astype(bool)
+                oracle_skip_fraction = float(np.mean(oracle_mask_bool))
+                oracle_skip_indices = [int(i) for i, flag in enumerate(oracle_mask_bool) if flag]
                 aggregates.append(
                     {
                         "mode": "teacher",
@@ -675,6 +688,15 @@ def run_teacher(
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
             prev_logits = out.logits.copy()
             prev_aux = out.aux if isinstance(out.aux, dict) else None
+            if capture_trace:
+                prompt_step_trace.append(
+                    {
+                        "step": int(t),
+                        "decoded_text": step_decoded,
+                        "oracle_skip_fraction": oracle_skip_fraction,
+                        "oracle_skip_indices": oracle_skip_indices,
+                    }
+                )
 
         cos_means.append(step_cos_means)
         dl2_means.append(step_dl2_means)
@@ -699,7 +721,7 @@ def run_teacher(
             decoded_text = engine.decode_tokens(tokens).strip()
             gen_text_lbd = None
             pred_word = None
-            gen_text_gsm = None
+            gen_text_gsm = decoded_text
             pred_ans = None
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
@@ -711,9 +733,7 @@ def run_teacher(
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_prompt = _maybe_chat_wrap(engine, prompt)
-                gen_text_gsm = _generate_text(engine, gen_prompt, max_new=gen_max_new)
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text_gsm))
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -731,6 +751,8 @@ def run_teacher(
                 record["gen_text_gsm8k"] = gen_text_gsm
                 record["pred_ans"] = pred_ans
             teacher_outputs_file.write(json.dumps(record) + "\n")
+        if capture_trace:
+            first_prompt_step_trace = prompt_step_trace
 
     layer_mse_curves: Dict[int, List[float]] = {}
     mse_steps: List[int] = list(range(1, num_steps)) if num_steps > 1 else []
@@ -817,6 +839,11 @@ def run_teacher(
         save_hist(np.array(dl2_hist_samples), os.path.join(out_dirs["figures"], f"teacher_dl2_hist_{timestamp}.png"), title="ΔL2 histogram")
     if len(dl2_norm_hist_samples) > 0:
         save_hist(np.array(dl2_norm_hist_samples), os.path.join(out_dirs["figures"], f"teacher_dl2norm_hist_{timestamp}.png"), title="ΔL2 normalized histogram")
+    if first_prompt_step_trace:
+        trace_path = os.path.join(out_dirs["runs"], f"teacher_prompt0_trace_{timestamp}.jsonl")
+        with open(trace_path, "w", encoding="utf-8") as trace_file:
+            for entry in first_prompt_step_trace:
+                trace_file.write(json.dumps(entry) + "\n")
 
     try:
         from src.viz.rich import render_teacher_suite
@@ -1173,14 +1200,18 @@ def run_rule_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                gen_text = decoded_text
+                if not gen_text:
+                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
+                gen_text = decoded_text
+                if not gen_text:
+                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text or ""))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -1539,14 +1570,18 @@ def run_learned_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                gen_text = decoded_text
+                if not gen_text:
+                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
+                gen_text = decoded_text
+                if not gen_text:
+                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text or ""))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -1770,14 +1805,18 @@ def run_adaptive(
             final_margins = margins
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                gen_text = decoded_text
+                if not gen_text:
+                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
+                gen_text = decoded_text
+                if not gen_text:
+                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text or ""))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
         nominal_steps = float(num_steps)

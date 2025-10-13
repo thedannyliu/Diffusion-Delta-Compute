@@ -39,7 +39,7 @@ ENGINE=${ENGINE:-d2f}
 DATA_ROOT=${DATA_ROOT:-}
 
 declare -a DATASETS=(
-  "gsm8k:200:gsm8k_adapt"
+  "gsm8k:1000:gsm8k_adapt"
 )
 
 for spec in "${DATASETS[@]}"; do
@@ -61,7 +61,7 @@ for spec in "${DATASETS[@]}"; do
     bash scripts/run_p4_adaptive.sh "$CONFIG_PATH" \
       --engine "$ENGINE" \
       --task "$TASK" \
-      --num_prompts 200 \
+      --num_prompts "$N" \
       --exp_name "${EPNAME}_trace5" \
       --lte_probe heun \
       --lte_eps 0.015 --lte_min_consec 2 --max_stride 4 --adaptive_budget 0.20
