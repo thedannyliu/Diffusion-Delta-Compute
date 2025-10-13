@@ -1,10 +1,9 @@
 #!/bin/bash
-#SBATCH -J dcllm_p5_smoke_all
+#SBATCH -J dcllm_p4_smoke_quick
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
-#SBATCH -c 8
-#SBATCH --mem=80G
-#SBATCH -t 02:30:00
+#SBATCH --mem=60G
+#SBATCH -t 01:30:00
 #SBATCH -o logs/%x-%j.out
 
 module load cuda/12.1 || true
@@ -26,7 +25,7 @@ if ! conda activate dcllm >/dev/null 2>&1; then
 fi
 
 export PYTHON="${PYTHON:-$(command -v python)}"
-export WANDB_MODE=${WANDB_MODE:-online}
+export WANDB_MODE=${WANDB_MODE:-disabled}
 export TRANSFORMERS_NO_TORCHVISION=1
 if [[ -n "$CONDA_PREFIX" ]]; then
   NV_ROOT="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia"
@@ -34,34 +33,28 @@ if [[ -n "$CONDA_PREFIX" ]]; then
 fi
 mkdir -p logs
 
-CONFIG_ORACLE=${CONFIG_ORACLE:-configs/p5_smoke.yaml}
-CONFIG_BASE=${CONFIG_BASE:-configs/p5_smoke.yaml}
+CONFIG_PATH=${CONFIG_PATH:-configs/p4_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
+OUT_DIR=${OUT_DIR:-reports_quick}
 DATA_ROOT=${DATA_ROOT:-}
+MAX_NEW=${MAX_NEW:-128}
 
 declare -a DATASETS=(
-  "gsm8k:200:gsm8k_p5"
+  "gsm8k:5:gsm8k_adapt_quick"
 )
 
 for spec in "${DATASETS[@]}"; do
   IFS=':' read -r TASK N EPNAME <<<"$spec"
-  echo "[sbatch][P5] Oracle task=${TASK} n=${N}"
+  echo "[sbatch][P4-quick] task=${TASK} n=${N}"
   srun --exclusive -N1 -n1 \
-    env ${DATA_ROOT:+DATA_ROOT="$DATA_ROOT"} MAX_NEW=256 \
-    bash scripts/run_p5_oracle.sh "$CONFIG_ORACLE" \
+    env OUT_DIR="$OUT_DIR" ${DATA_ROOT:+DATA_ROOT="$DATA_ROOT"} MAX_NEW="$MAX_NEW" \
+    bash scripts/run_p4_adaptive.sh "$CONFIG_PATH" \
       --engine "$ENGINE" \
       --task "$TASK" \
       --num_prompts "$N" \
-      --exp_name "${EPNAME}_oracle"
-
-  echo "[sbatch][P5] Baselines task=${TASK} n=${N}"
-  srun --exclusive -N1 -n1 \
-    env ${DATA_ROOT:+DATA_ROOT="$DATA_ROOT"} MAX_NEW=256 \
-    bash scripts/run_p5_baselines.sh "$CONFIG_BASE" \
-      --engine "$ENGINE" \
-      --task "$TASK" \
-      --num_prompts "$N" \
-      --exp_name "${EPNAME}_baselines"
+      --exp_name "$EPNAME" \
+      --lte_probe heun \
+      --lte_eps 0.015 --lte_min_consec 2 --max_stride 4 --adaptive_budget 0.20
 done
 
-echo "[sbatch] P5 smoke triplet completed"
+echo "[sbatch] P4 quick smoke completed"

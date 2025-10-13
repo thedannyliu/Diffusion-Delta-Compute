@@ -14,6 +14,8 @@ ENGINE=${ENGINE:-}
 OUT_DIR=${OUT_DIR:-}
 TASKS_CFG=${TASKS_CFG:-}
 PATHS_CFG=${PATHS_CFG:-}
+DATA_ROOT=${DATA_ROOT:-}
+MAX_NEW=${MAX_NEW:-}
 
 CLI_ARGS=("--mode" "oracle" "--config" "$CONFIG_PATH")
 if [[ -n "$ENGINE" ]]; then
@@ -27,6 +29,12 @@ if [[ -n "$TASKS_CFG" ]]; then
 fi
 if [[ -n "$PATHS_CFG" ]]; then
   CLI_ARGS+=("--paths_cfg" "$PATHS_CFG")
+fi
+if [[ -n "$DATA_ROOT" ]]; then
+  CLI_ARGS+=("--data_root" "$DATA_ROOT")
+fi
+if [[ -n "$MAX_NEW" ]]; then
+  CLI_ARGS+=("--max_new_tokens" "$MAX_NEW")
 fi
 
 CLI_ARGS+=("$@")

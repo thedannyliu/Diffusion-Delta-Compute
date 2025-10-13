@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J dcllm_p5_smoke_all
+#SBATCH -J dcllm_p4_conservative
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
 #SBATCH -c 8
@@ -34,34 +34,30 @@ if [[ -n "$CONDA_PREFIX" ]]; then
 fi
 mkdir -p logs
 
-CONFIG_ORACLE=${CONFIG_ORACLE:-configs/p5_smoke.yaml}
-CONFIG_BASE=${CONFIG_BASE:-configs/p5_smoke.yaml}
+CONFIG_PATH=${CONFIG_PATH:-configs/p4_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
+
+# 可覆寫的資料根目錄（若提供，將強制從本地載入固定順序的資料）
 DATA_ROOT=${DATA_ROOT:-}
 
 declare -a DATASETS=(
-  "gsm8k:200:gsm8k_p5"
+  "gsm8k:200:gsm8k_adapt_conservative"
 )
 
 for spec in "${DATASETS[@]}"; do
   IFS=':' read -r TASK N EPNAME <<<"$spec"
-  echo "[sbatch][P5] Oracle task=${TASK} n=${N}"
+  echo "[sbatch][P4-conservative] task=${TASK} n=${N}"
   srun --exclusive -N1 -n1 \
-    env ${DATA_ROOT:+DATA_ROOT="$DATA_ROOT"} MAX_NEW=256 \
-    bash scripts/run_p5_oracle.sh "$CONFIG_ORACLE" \
+    env ${DATA_ROOT:+DATA_ROOT="$DATA_ROOT"} MAX_NEW=256 HARD_BUDGET=1 \
+    bash scripts/run_p4_adaptive.sh "$CONFIG_PATH" \
       --engine "$ENGINE" \
       --task "$TASK" \
       --num_prompts "$N" \
-      --exp_name "${EPNAME}_oracle"
-
-  echo "[sbatch][P5] Baselines task=${TASK} n=${N}"
-  srun --exclusive -N1 -n1 \
-    env ${DATA_ROOT:+DATA_ROOT="$DATA_ROOT"} MAX_NEW=256 \
-    bash scripts/run_p5_baselines.sh "$CONFIG_BASE" \
-      --engine "$ENGINE" \
-      --task "$TASK" \
-      --num_prompts "$N" \
-      --exp_name "${EPNAME}_baselines"
+      --exp_name "$EPNAME" \
+      --lte_probe heun \
+      --lte_eps 0.010 --lte_min_consec 3 --max_stride 3 \
+      --adaptive_budget 0.20 \
+      --risk_delta 0.02
 done
 
-echo "[sbatch] P5 smoke triplet completed"
+echo "[sbatch] P4 conservative job completed"

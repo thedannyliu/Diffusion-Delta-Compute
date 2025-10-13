@@ -39,7 +39,7 @@ ENGINE=${ENGINE:-d2f}
 
 # spec: TASK:N_PROMPTS:PROFILE:RISK_DELTA:EXP
 declare -a DATASETS=(
-  "gsm8k:200:balanced:0.010:gsm8k_rule"
+  "gsm8k:1000:balanced:0.010:gsm8k_rule"
 )
 
 # 指定要對標的 P1 teacher 輸出資料夾（供 quantiles 使用）
@@ -56,6 +56,8 @@ else
   echo "[P2] WARN: P1_ROOT=$P1_ROOT 不存在；將讓程式自動 fallback。" >&2
 fi
 
+DATA_ROOT=${DATA_ROOT:-}
+
 echo "[sbatch] P2 smoke triplet starting (engine=${ENGINE})"
 for spec in "${DATASETS[@]}"; do
   IFS=':' read -r TASK N PROFILE RDELTA EPNAME <<<"$spec"
@@ -65,6 +67,8 @@ for spec in "${DATASETS[@]}"; do
       --engine "$ENGINE" \
       --task "$TASK" \
       --num_prompts "$N" \
+      ${DATA_ROOT:+--data_root "$DATA_ROOT"} \
+      --max_new_tokens 256 \
       --profile "$PROFILE" \
       --risk_delta "$RDELTA" \
       --budget_fraction 0.60 \
@@ -75,7 +79,9 @@ for spec in "${DATASETS[@]}"; do
     bash scripts/run_p2_rule_gate.sh "$CONFIG_PATH" \
       --engine "$ENGINE" \
       --task "$TASK" \
-      --num_prompts 200 \
+      --num_prompts "$N" \
+      ${DATA_ROOT:+--data_root "$DATA_ROOT"} \
+      --max_new_tokens 256 \
       --profile "$PROFILE" \
       --risk_delta "$RDELTA" \
       --budget_fraction 0.60 \

@@ -2,8 +2,8 @@
 #SBATCH -J dcllm_p1_smoke_quick
 #SBATCH -p ice-gpu
 #SBATCH --gres=gpu:h100:1
-#SBATCH --mem=40G
-#SBATCH -t 02:00:00
+#SBATCH --mem=80G
+#SBATCH -t 00:30:00
 #SBATCH -o logs/%x-%j.out
 
 module load cuda/12.1 || true
@@ -26,6 +26,11 @@ fi
 
 export PYTHON="${PYTHON:-$(command -v python)}"
 export WANDB_MODE=${WANDB_MODE:-disabled}
+export TRANSFORMERS_NO_TORCHVISION=1
+if [[ -n "$CONDA_PREFIX" ]]; then
+  NV_ROOT="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia"
+  export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$NV_ROOT/nvjitlink/lib:$NV_ROOT/cublas/lib:$NV_ROOT/cusparse/lib:$NV_ROOT/cudnn/lib:$NV_ROOT/cusolver/lib:$NV_ROOT/cufft/lib:$NV_ROOT/curand/lib:$NV_ROOT/nvtx/lib:${LD_LIBRARY_PATH:-}"
+fi
 mkdir -p logs
 
 CONFIG_PATH=${CONFIG_PATH:-configs/p1_smoke.yaml}
@@ -48,7 +53,6 @@ for spec in "${DATASETS[@]}"; do
       --num_prompts 3 \
       --out_dir "$OUT_DIR" \
       --exp_name "${EPNAME}" \
-      --oracle_eval \
       --lte_probe heun
 
 done

@@ -6,7 +6,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -128,6 +128,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adaptive_budget", type=float, default=0.20, help="Adaptive total skip budget")
     parser.add_argument("--sprt_alpha", type=float, default=0.005, help="SPRT Type I error")
     parser.add_argument("--sprt_beta", type=float, default=0.005, help="SPRT Type II error")
+    parser.add_argument("--adaptive_hard_budget", action="store_true", help="Enforce skip_budget as a hard cap in adaptive mode")
     return parser.parse_args()
 
 
@@ -510,6 +511,7 @@ def run_teacher(
     dl2_rho = float(label_cfg.get("delta_l2_rho", 0.05))
     kl_max = float(label_cfg.get("kl_max", 0.01))
     timestamp = time.strftime("%Y%m%d_%H%M%S")
+    total_time_s = max(1e-6, time.time() - total_start)
     layer_step_mse: Dict[Tuple[int, int], List[float]] = defaultdict(list)
 
     metric_samples = {
@@ -530,6 +532,7 @@ def run_teacher(
     lambada_total = len(labels) if is_lambada and labels is not None else 0
     gsm_correct = 0
     gsm_total = len(labels) if is_gsm8k and labels is not None else 0
+    first_prompt_step_trace: List[Dict[str, Any]] = []
 
     for prompt_idx, prompt in enumerate(prompts):
         state = engine.encode_prompt(prompt)
@@ -550,6 +553,8 @@ def run_teacher(
 
         seq_start = time.time()
         final_aux: Optional[Dict] = None
+        capture_trace = prompt_idx == 0
+        prompt_step_trace: List[Dict[str, Any]] = []
         for t in range(num_steps):
             out = engine.step(state, t)
             # Immediate GPU sample after a GPU-heavy op to avoid missing short spikes
@@ -558,6 +563,13 @@ def run_teacher(
             except Exception:
                 pass
             final_aux = out.aux if isinstance(out.aux, dict) else None
+            step_tokens, _ = logits_argmax_and_margin(out.logits)
+            try:
+                step_decoded = engine.decode_tokens(step_tokens).strip()
+            except Exception:
+                step_decoded = ""
+            oracle_skip_fraction: Optional[float] = None
+            oracle_skip_indices: Optional[List[int]] = None
             if prev_hidden is not None and prev_logits is not None:
                 # Build valid mask (exclude padding and special tokens)
                 valid_mask: Optional[np.ndarray] = None
@@ -628,6 +640,9 @@ def run_teacher(
                         dl2_layer = dl2_layer[valid_mask]
                     layer_step_values_cos[(li, t)] = cos_layer
                     layer_step_values_dl2[(li, t)] = dl2_layer
+                oracle_mask_bool = oracle_mask.astype(bool)
+                oracle_skip_fraction = float(np.mean(oracle_mask_bool))
+                oracle_skip_indices = [int(i) for i, flag in enumerate(oracle_mask_bool) if flag]
                 aggregates.append(
                     {
                         "mode": "teacher",
@@ -673,6 +688,15 @@ def run_teacher(
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
             prev_logits = out.logits.copy()
             prev_aux = out.aux if isinstance(out.aux, dict) else None
+            if capture_trace:
+                prompt_step_trace.append(
+                    {
+                        "step": int(t),
+                        "decoded_text": step_decoded,
+                        "oracle_skip_fraction": oracle_skip_fraction,
+                        "oracle_skip_indices": oracle_skip_indices,
+                    }
+                )
 
         cos_means.append(step_cos_means)
         dl2_means.append(step_dl2_means)
@@ -697,7 +721,7 @@ def run_teacher(
             decoded_text = engine.decode_tokens(tokens).strip()
             gen_text_lbd = None
             pred_word = None
-            gen_text_gsm = None
+            gen_text_gsm = decoded_text
             pred_ans = None
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
@@ -709,9 +733,7 @@ def run_teacher(
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_prompt = _maybe_chat_wrap(engine, prompt)
-                gen_text_gsm = _generate_text(engine, gen_prompt, max_new=gen_max_new)
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text_gsm))
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -729,6 +751,8 @@ def run_teacher(
                 record["gen_text_gsm8k"] = gen_text_gsm
                 record["pred_ans"] = pred_ans
             teacher_outputs_file.write(json.dumps(record) + "\n")
+        if capture_trace:
+            first_prompt_step_trace = prompt_step_trace
 
     layer_mse_curves: Dict[int, List[float]] = {}
     mse_steps: List[int] = list(range(1, num_steps)) if num_steps > 1 else []
@@ -815,6 +839,11 @@ def run_teacher(
         save_hist(np.array(dl2_hist_samples), os.path.join(out_dirs["figures"], f"teacher_dl2_hist_{timestamp}.png"), title="ΔL2 histogram")
     if len(dl2_norm_hist_samples) > 0:
         save_hist(np.array(dl2_norm_hist_samples), os.path.join(out_dirs["figures"], f"teacher_dl2norm_hist_{timestamp}.png"), title="ΔL2 normalized histogram")
+    if first_prompt_step_trace:
+        trace_path = os.path.join(out_dirs["runs"], f"teacher_prompt0_trace_{timestamp}.jsonl")
+        with open(trace_path, "w", encoding="utf-8") as trace_file:
+            for entry in first_prompt_step_trace:
+                trace_file.write(json.dumps(entry) + "\n")
 
     try:
         from src.viz.rich import render_teacher_suite
@@ -1159,6 +1188,7 @@ def run_rule_gate(
 
         final_tokens: Optional[List[int]] = None
         final_margins: Optional[List[float]] = None
+        decoded_text: Optional[str] = None
         if prev_logits is not None:
             if is_wikitext and prev_aux is not None:
                 input_ids = prev_aux.get("input_ids") if isinstance(prev_aux, dict) else None
@@ -1170,14 +1200,18 @@ def run_rule_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                gen_text = decoded_text
+                if not gen_text:
+                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
+                gen_text = decoded_text
+                if not gen_text:
+                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text or ""))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -1209,7 +1243,11 @@ def run_rule_gate(
                 tokens=final_tokens,
                 margins=final_margins,
                 logits_checksum=checksum,
-                extras={"prompt_length": len(prompt)},
+                extras={
+                    "prompt_length": len(prompt),
+                    "prompt": prompt,
+                    "decoded_text": decoded_text,
+                },
             )
 
         if consistency_check:
@@ -1520,6 +1558,7 @@ def run_learned_gate(
 
         final_tokens: Optional[List[int]] = None
         final_margins: Optional[List[float]] = None
+        decoded_text: Optional[str] = None
         if prev_logits is not None:
             if is_wikitext and prev_aux is not None:
                 input_ids = prev_aux.get("input_ids") if isinstance(prev_aux, dict) else None
@@ -1531,14 +1570,18 @@ def run_learned_gate(
             decoded_text = engine.decode_tokens(final_tokens).strip()
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                gen_text = decoded_text
+                if not gen_text:
+                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
+                gen_text = decoded_text
+                if not gen_text:
+                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text or ""))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -1549,7 +1592,11 @@ def run_learned_gate(
                 tokens=final_tokens,
                 margins=final_margins,
                 logits_checksum=checksum,
-                extras={"prompt_length": len(prompt)},
+                extras={
+                    "prompt_length": len(prompt),
+                    "prompt": prompt,
+                    "decoded_text": decoded_text,
+                },
             )
 
         if consistency_check:
@@ -1645,9 +1692,11 @@ def run_adaptive(
     scheduler_cfg: AdaptiveSchedulerConfig,
     risk_delta: float,
     skip_budget: float,
+    hard_budget: bool = False,
     labels: Optional[List[str]] = None,
     task_name: Optional[str] = None,
     gen_max_new: int = 128,
+    decision_logger: Optional[DecisionLogger] = None,
 ) -> None:
     scheduler = AdaptiveScheduler(scheduler_cfg)
     calibrator = ConformalRiskCalibrator(delta=risk_delta)
@@ -1658,6 +1707,8 @@ def run_adaptive(
     stride_traces: List[List[int]] = []
     lte_threshold_traces: List[List[float]] = []
     total_start = time.time()
+    sampler = GPUUtilSampler(interval_sec=0.5)
+    sampler.start()
 
     is_wikitext = task_name == "wikitext"
     is_lambada = task_name == "lambada"
@@ -1673,6 +1724,9 @@ def run_adaptive(
         prev_hidden: Optional[List[np.ndarray]] = None
         prev_logits: Optional[np.ndarray] = None
         prev_aux: Optional[Dict] = None
+        final_tokens: Optional[List[int]] = None
+        final_margins: Optional[List[float]] = None
+        decoded_text: Optional[str] = None
         seq_start = time.time()
         effective_steps = 0.0
         prompt_lte: List[float] = []
@@ -1719,6 +1773,18 @@ def run_adaptive(
             prompt_stride.append(scheduler.stride)
             prompt_lte_thresholds.append(lte_threshold)
             stride = scheduler.stride
+            # Optional hard cap on cumulative skip ratio per sequence
+            if hard_budget and (t + 1) > 0:
+                eff_next = effective_steps + (1.0 / max(1, stride))
+                skip_so_far = 1.0 - (eff_next / float(t + 1))
+                if skip_so_far > skip_budget:
+                    stride = 1
+                    # reflect the correction in recorded stride and internal state
+                    prompt_stride[-1] = 1
+                    try:
+                        scheduler._current_stride = 1  # best-effort sync
+                    except Exception:
+                        pass
             effective_steps += 1.0 / max(1, stride)
 
             prev_hidden = [h.copy() for h in out.hidden_by_layer]
@@ -1733,27 +1799,52 @@ def run_adaptive(
                 pad_token_id = int(prev_aux.get("pad_token_id", -1)) if isinstance(prev_aux, dict) else -1
                 if input_ids is not None:
                     _accumulate_ppl(ppl_stats, prev_logits, input_ids, pad_token_id, special_mask)
-            tokens, _ = logits_argmax_and_margin(prev_logits)
+            tokens, margins = logits_argmax_and_margin(prev_logits)
             decoded_text = engine.decode_tokens(tokens).strip()
+            final_tokens = tokens
+            final_margins = margins
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                gen_text = decoded_text
+                if not gen_text:
+                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
+                gen_text = decoded_text
+                if not gen_text:
+                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text or ""))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
         nominal_steps = float(num_steps)
-        skip_estimates.append(max(0.0, 1.0 - (effective_steps / nominal_steps)))
+        skip_estimate = max(0.0, 1.0 - (effective_steps / nominal_steps))
+        skip_estimates.append(skip_estimate)
         scheduler.reset()
         lte_traces.append(prompt_lte)
         risk_traces.append(prompt_risk)
         stride_traces.append(prompt_stride)
         lte_threshold_traces.append(prompt_lte_thresholds)
+        if decision_logger is not None and prev_logits is not None and final_tokens is not None and final_margins is not None:
+            checksum = float(np.sum(prev_logits)) if prev_logits.size else 0.0
+            decision_logger.log_final_output(
+                prompt_id=prompt_idx,
+                tokens=final_tokens,
+                margins=final_margins,
+                logits_checksum=checksum,
+                extras={
+                    "prompt_length": len(prompt),
+                    "prompt": prompt,
+                    "decoded_text": decoded_text,
+                    "stride_trace": prompt_stride,
+                    "lte_trace": prompt_lte,
+                    "risk_trace": prompt_risk,
+                    "lte_threshold_trace": prompt_lte_thresholds,
+                    "skip_estimate": skip_estimate,
+                },
+            )
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     # Simple visuals: histogram of per-sequence estimated skip ratios
@@ -1777,6 +1868,9 @@ def run_adaptive(
         )
     except Exception:
         pass
+    total_time_s = max(1e-6, time.time() - total_start)
+    sampler.stop()
+    gpu = sampler.metrics or (query_gpu_utilization() or {})
     quality_metrics: Dict[str, Dict[str, float]] = {}
     if is_wikitext and ppl_stats["token_count"] > 0:
         ppl_value = float(np.exp(ppl_stats["nll_sum"] / ppl_stats["token_count"]))
@@ -1804,11 +1898,15 @@ def run_adaptive(
         "latency_ms_mean": float(np.mean(per_seq_latency_ms) if per_seq_latency_ms else 0.0),
         "latency_ms_p50": float(np.percentile(per_seq_latency_ms, 50) if per_seq_latency_ms else 0.0),
         "latency_ms_p90": float(np.percentile(per_seq_latency_ms, 90) if per_seq_latency_ms else 0.0),
+        "throughput_seq_per_s": float(len(prompts) / total_time_s) if len(prompts) else 0.0,
         "skip_ratio_est_mean": float(np.mean(skip_estimates) if skip_estimates else 0.0),
         "skip_budget": float(skip_budget),
         "risk_delta": float(risk_delta),
         "lte_eps": float(scheduler_cfg.lte_eps),
         "max_stride": int(scheduler_cfg.max_stride),
+        "decision_log": decision_logger.decision_path if decision_logger is not None else None,
+        "final_outputs_path": decision_logger.final_outputs_path if decision_logger is not None else None,
+        **{f"gpu_{k}": v for k, v in gpu.items()},
     }
     if quality_metrics:
         summary["quality"] = quality_metrics
@@ -2056,7 +2154,7 @@ def main() -> None:
 
     decision_loggers: List[DecisionLogger] = []
     decision_logger: Optional[DecisionLogger] = None
-    if mode in {"rule_gate", "learned_gate"}:
+    if mode in {"rule_gate", "learned_gate", "adaptive"}:
         decision_logger = DecisionLogger(run_dir, mode, os.path.basename(run_dir))
         decision_loggers.append(decision_logger)
 
@@ -2226,9 +2324,11 @@ def main() -> None:
                     scheduler_cfg=scheduler_cfg,
                     risk_delta=risk_delta,
                     skip_budget=float(args.adaptive_budget),
+                    hard_budget=bool(args.adaptive_hard_budget),
                     labels=prompt_labels,
                     task_name=task,
                     gen_max_new=max_new_tokens,
+                    decision_logger=decision_logger,
                 )
             elif mode == "oracle":
                 teacher_artifacts = run_teacher(

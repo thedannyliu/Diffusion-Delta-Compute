@@ -29,9 +29,14 @@ logs/
 reports_0929/
 reports_quick/
 
+reports.zip
 # Notebooks
 .ipynb_checkpoints/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Ignore generated reports and archives
+reports/
+*.zip
