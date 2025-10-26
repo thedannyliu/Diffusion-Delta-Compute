@@ -37,9 +37,18 @@ mkdir -p logs
 CONFIG_PATH=${CONFIG_PATH:-configs/p4_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 DATA_ROOT=${DATA_ROOT:-}
+P1_DEFAULT_REFERENCE=/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251013_174729/reports/artifacts/features/teacher_features_20251013_174739.npz
+P1_REFERENCE=${P1_ROOT:-$P1_DEFAULT_REFERENCE}
+if [[ -f "$P1_REFERENCE" ]]; then
+  # 允許直接給定 features 檔案，往上回推到 P1 執行根目錄
+  P1_ROOT=$(dirname "$(dirname "$(dirname "$(dirname "$P1_REFERENCE")")")")
+else
+  P1_ROOT="$P1_REFERENCE"
+fi
+export P1_ROOT
 
 declare -a DATASETS=(
-  "gsm8k:1000:gsm8k_adapt"
+  "gsm8k:50:gsm8k_adapt"
 )
 
 for spec in "${DATASETS[@]}"; do

@@ -38,7 +38,14 @@ CONFIG_PATH=${CONFIG_PATH:-configs/p3_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 WEIGHTS_OUT=${WEIGHTS_OUT:-models/gates/learned_gate_latest.npz}
 # 指定 P1 teacher 輸出根目錄（供 features 使用）
-P1_ROOT=${P1_ROOT:-/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251006_002834}
+P1_DEFAULT_REFERENCE=/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251013_174729/reports/artifacts/features/teacher_features_20251013_174739.npz
+P1_REFERENCE=${P1_ROOT:-$P1_DEFAULT_REFERENCE}
+if [[ -f "$P1_REFERENCE" ]]; then
+  # 允許直接給定 features 檔案，往上回推到 P1 執行根目錄
+  P1_ROOT=$(dirname "$(dirname "$(dirname "$(dirname "$P1_REFERENCE")")")")
+else
+  P1_ROOT="$P1_REFERENCE"
+fi
 DATA_ROOT=${DATA_ROOT:-}
 
 # Train once using P1 features, then evaluate per dataset.
@@ -54,7 +61,7 @@ srun --exclusive -N1 -n1 bash -lc '
 '
 
 declare -a DATASETS=(
-  "gsm8k:1000:gsm8k_learned"
+  "gsm8k:50:gsm8k_learned"
 )
 
 for spec in "${DATASETS[@]}"; do

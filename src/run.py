@@ -370,6 +370,31 @@ def _generate_text(engine: BaseEngine, prompt: str, max_new: int) -> str:
         # Generation not supported by the current engine/model; degrade gracefully
         return ""
 
+
+def _safe_decode(engine: BaseEngine, token_ids: Sequence[int]) -> str:
+    try:
+        return engine.decode_tokens(token_ids).strip()
+    except Exception:
+        return ""
+
+
+def _evaluation_text_from_diffusion(
+    diffusion_text: Optional[str],
+    prompt: str,
+    engine: BaseEngine,
+    max_new: int,
+) -> Tuple[str, str]:
+    """
+    Returns the text used for scoring along with its source.
+    Source is 'diffusion' when the decoded diffusion text is non-empty,
+    otherwise 'greedy_fallback' after regenerating from the prompt.
+    """
+    if diffusion_text and diffusion_text.strip():
+        return diffusion_text.strip(), "diffusion"
+    regen_prompt = _maybe_chat_wrap(engine, prompt)
+    regenerated = _generate_text(engine, regen_prompt, max_new=max_new)
+    return regenerated.strip(), "greedy_fallback"
+
 def _maybe_chat_wrap(engine: BaseEngine, prompt: str) -> str:
     """If the engine supports chat templates (e.g., Dream Instruct), wrap the
     raw prompt into a single-user chat turn so generation follows the
@@ -482,7 +507,7 @@ def run_teacher(
     labels: Optional[List[str]] = None,
     gen_max_new: int = 128,
 ) -> TeacherArtifacts:
-    from src.viz.plots import save_heatmap, save_hist
+    from src.viz.plots import save_heatmap, save_hist, save_errorbar
 
     aggregates: List[Dict] = []
     cos_means: List[List[float]] = []
@@ -533,6 +558,11 @@ def run_teacher(
     gsm_correct = 0
     gsm_total = len(labels) if is_gsm8k and labels is not None else 0
     first_prompt_step_trace: List[Dict[str, Any]] = []
+    layer_prompt_cos: Dict[int, List[float]] = defaultdict(list)
+    layer_cos_means: Dict[int, List[float]] = defaultdict(list)
+    layer_cos_stds: Dict[int, List[float]] = defaultdict(list)
+    layer_dl2_means: Dict[int, List[float]] = defaultdict(list)
+    layer_dl2_stds: Dict[int, List[float]] = defaultdict(list)
 
     for prompt_idx, prompt in enumerate(prompts):
         state = engine.encode_prompt(prompt)
@@ -631,6 +661,7 @@ def run_teacher(
                     for li, mse_value in enumerate(layer_mse_values):
                         layer_step_mse[(li, t)].append(mse_value)
                 # Save per-layer token vectors for IQR
+                num_layers_current = len(out.hidden_by_layer)
                 for li, (h_now, h_prev) in enumerate(zip(out.hidden_by_layer, prev_hidden)):
                     # Compute per-token layer-wise metrics (masked)
                     cos_layer = cosine_similarity_tokens([h_now], [h_prev])
@@ -640,6 +671,25 @@ def run_teacher(
                         dl2_layer = dl2_layer[valid_mask]
                     layer_step_values_cos[(li, t)] = cos_layer
                     layer_step_values_dl2[(li, t)] = dl2_layer
+                    if t == num_steps - 1:
+                        mean_cos_layer = float(np.mean(cos_layer)) if cos_layer.size else float("nan")
+                        layer_prompt_cos[li].append(mean_cos_layer)
+                # record per-layer stats for plots
+                for li in range(num_layers_current):
+                    cos_vals = layer_step_values_cos.get((li, t))
+                    dl2_vals = layer_step_values_dl2.get((li, t))
+                    if cos_vals is not None and cos_vals.size:
+                        layer_cos_means[li].append(float(np.mean(cos_vals)))
+                        layer_cos_stds[li].append(float(np.std(cos_vals)))
+                    else:
+                        layer_cos_means[li].append(float("nan"))
+                        layer_cos_stds[li].append(float("nan"))
+                    if dl2_vals is not None and dl2_vals.size:
+                        layer_dl2_means[li].append(float(np.mean(dl2_vals)))
+                        layer_dl2_stds[li].append(float(np.std(dl2_vals)))
+                    else:
+                        layer_dl2_means[li].append(float("nan"))
+                        layer_dl2_stds[li].append(float("nan"))
                 oracle_mask_bool = oracle_mask.astype(bool)
                 oracle_skip_fraction = float(np.mean(oracle_mask_bool))
                 oracle_skip_indices = [int(i) for i, flag in enumerate(oracle_mask_bool) if flag]
@@ -718,22 +768,28 @@ def run_teacher(
 
             tokens, margins = logits_argmax_and_margin(prev_logits)
             checksum = float(np.sum(prev_logits)) if prev_logits.size else 0.0
-            decoded_text = engine.decode_tokens(tokens).strip()
+            decoded_text = _safe_decode(engine, tokens)
+            diffusion_text = decoded_text
+            eval_text_val: Optional[str] = None
+            eval_text_source: Optional[str] = None
+            if (is_lambada or is_gsm8k) and labels is not None and prompt_idx < len(labels):
+                eval_text_val, eval_text_source = _evaluation_text_from_diffusion(
+                    diffusion_text, prompt, engine, gen_max_new
+                )
             gen_text_lbd = None
             pred_word = None
-            gen_text_gsm = decoded_text
+            gen_text_gsm = None
             pred_ans = None
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_prompt = _maybe_chat_wrap(engine, prompt)
-                gen_text_lbd = _generate_text(engine, gen_prompt, max_new=gen_max_new)
-                # take the first word from generated continuation
+                gen_text_lbd = eval_text_val or ""
                 pred_word = _extract_last_word(gen_text_lbd.split()[0] if gen_text_lbd else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(decoded_text))
+                gen_text_gsm = eval_text_val or ""
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text_gsm))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -744,15 +800,91 @@ def run_teacher(
                 "margins": margins,
                 "logits_checksum": checksum,
             }
+            record["diffusion_text"] = diffusion_text
             if is_lambada:
                 record["gen_text_lambada"] = gen_text_lbd
+                if eval_text_source is not None:
+                    record["gen_text_lambada_source"] = eval_text_source
                 record["pred_word"] = pred_word
             if is_gsm8k:
                 record["gen_text_gsm8k"] = gen_text_gsm
+                if eval_text_source is not None:
+                    record["gen_text_gsm8k_source"] = eval_text_source
                 record["pred_ans"] = pred_ans
             teacher_outputs_file.write(json.dumps(record) + "\n")
         if capture_trace:
             first_prompt_step_trace = prompt_step_trace
+
+    layer_prompt_arr: Optional[np.ndarray] = None
+    if layer_prompt_cos:
+        layer_ids = sorted(layer_prompt_cos.keys())
+        num_prompts_total = len(prompts)
+        arr = np.full((len(layer_ids), num_prompts_total), np.nan, dtype=np.float32)
+        for idx, layer in enumerate(layer_ids):
+            values = layer_prompt_cos[layer]
+            if len(values) < num_prompts_total:
+                values = values + [float("nan")] * (num_prompts_total - len(values))
+            arr[idx, :len(values)] = np.asarray(values[:num_prompts_total], dtype=np.float32)
+        layer_prompt_arr = arr
+
+    layer_indices_order = sorted(layer_cos_means.keys())
+    cosine_layer_profile: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    dl2_layer_profile: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    cosine_layer_err: Optional[np.ndarray] = None
+    dl2_layer_err: Optional[np.ndarray] = None
+    num_prompts_total = len(prompts)
+    steps_recorded = max(0, num_steps - 1)
+    if layer_indices_order and steps_recorded > 0 and num_prompts_total > 0:
+        cos_means_vals: List[float] = []
+        cos_err_vals: List[float] = []
+        dl2_means_vals: List[float] = []
+        dl2_err_vals: List[float] = []
+        valid_layers: List[int] = []
+        for li in layer_indices_order:
+            cos_series = np.asarray(layer_cos_means[li], dtype=np.float32)
+            dl2_series = np.asarray(layer_dl2_means[li], dtype=np.float32)
+            if cos_series.size == 0:
+                continue
+            try:
+                cos_matrix = cos_series.reshape(num_prompts_total, steps_recorded)
+            except ValueError:
+                cos_matrix = cos_series.reshape(-1)
+            valid_layers.append(li)
+            cos_flat = cos_matrix.flatten()
+            cos_means_vals.append(float(np.nanmean(cos_flat)))
+            cos_err_vals.append(float(np.nanstd(cos_flat)))
+            if dl2_series.size:
+                try:
+                    dl2_matrix = dl2_series.reshape(num_prompts_total, steps_recorded)
+                except ValueError:
+                    dl2_matrix = dl2_series.reshape(-1)
+                dl2_flat = dl2_matrix.flatten()
+                dl2_means_vals.append(float(np.nanmean(dl2_flat)))
+                dl2_err_vals.append(float(np.nanstd(dl2_flat)))
+            else:
+                dl2_means_vals.append(float("nan"))
+                dl2_err_vals.append(float("nan"))
+        if cos_means_vals:
+            cosine_layer_profile = (
+                np.asarray(valid_layers, dtype=np.int32),
+                np.asarray(cos_means_vals, dtype=np.float32),
+            )
+            cosine_layer_err = np.asarray(cos_err_vals, dtype=np.float32)
+        else:
+            cosine_layer_profile = None
+            cosine_layer_err = None
+        if dl2_means_vals:
+            dl2_layer_profile = (
+                np.asarray(valid_layers, dtype=np.int32),
+                np.asarray(dl2_means_vals, dtype=np.float32),
+            )
+            dl2_layer_err = np.asarray(dl2_err_vals, dtype=np.float32)
+        else:
+            dl2_layer_profile = None
+            dl2_layer_err = None
+    else:
+        cosine_layer_err = None
+        dl2_layer_err = None
 
     layer_mse_curves: Dict[int, List[float]] = {}
     mse_steps: List[int] = list(range(1, num_steps)) if num_steps > 1 else []
@@ -792,6 +924,32 @@ def run_teacher(
     if len(dl2_means) > 0 and len(dl2_means[0]) > 0:
         arr = np.array(dl2_means).T
         save_heatmap(arr, os.path.join(out_dirs["figures"], f"teacher_dl2_heatmap_{timestamp}.png"), title="ΔL2 mean per step")
+    if layer_prompt_arr is not None and layer_prompt_arr.size:
+        save_heatmap(layer_prompt_arr, os.path.join(out_dirs["figures"], f"teacher_layer_prompt_heatmap_{timestamp}.png"), title="Final-step cosine mean per layer", xlabel="prompts", ylabel="layers")
+    if cosine_layer_profile is not None and cosine_layer_err is not None:
+        cos_err = np.nan_to_num(cosine_layer_err, nan=0.0)
+        save_errorbar(
+            cosine_layer_profile[0],
+            cosine_layer_profile[1],
+            cos_err,
+            os.path.join(out_dirs["figures"], f"teacher_layer_cosine_profile_{timestamp}.png"),
+            title="Cosine similarity between consecutive diffusion steps",
+            xlabel="layer index",
+            ylabel="cosine similarity",
+            color="crimson",
+        )
+    if dl2_layer_profile is not None and dl2_layer_err is not None:
+        dl2_err = np.nan_to_num(dl2_layer_err, nan=0.0)
+        save_errorbar(
+            dl2_layer_profile[0],
+            dl2_layer_profile[1],
+            dl2_err,
+            os.path.join(out_dirs["figures"], f"teacher_layer_dl2_profile_{timestamp}.png"),
+            title="L2 norm ratio between consecutive diffusion steps",
+            xlabel="layer index",
+            ylabel="ΔL2 ratio",
+            color="darkorange",
+        )
     # Export KL/entropy step curves to CSV for further plotting
     if kl_means:
         kl_csv = os.path.join(out_dirs["runs"], f"teacher_kl_entropy_{timestamp}.csv")
@@ -1197,21 +1355,24 @@ def run_rule_gate(
                 if input_ids is not None:
                     _accumulate_ppl(ppl_stats, prev_logits, input_ids, pad_token_id, special_mask)
             final_tokens, final_margins = logits_argmax_and_margin(prev_logits)
-            decoded_text = engine.decode_tokens(final_tokens).strip()
+            decoded_text = _safe_decode(engine, final_tokens)
+            diffusion_text = decoded_text
+            eval_text_val: Optional[str] = None
+            eval_text_source: Optional[str] = None
+            if (is_lambada or is_gsm8k) and labels is not None and prompt_idx < len(labels):
+                eval_text_val, eval_text_source = _evaluation_text_from_diffusion(
+                    diffusion_text, prompt, engine, gen_max_new
+                )
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = decoded_text
-                if not gen_text:
-                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                gen_text = eval_text_val or ""
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = decoded_text
-                if not gen_text:
-                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text or ""))
+                gen_text = eval_text_val or ""
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -1247,6 +1408,7 @@ def run_rule_gate(
                     "prompt_length": len(prompt),
                     "prompt": prompt,
                     "decoded_text": decoded_text,
+                    "evaluation_text_source": eval_text_source,
                 },
             )
 
@@ -1559,6 +1721,7 @@ def run_learned_gate(
         final_tokens: Optional[List[int]] = None
         final_margins: Optional[List[float]] = None
         decoded_text: Optional[str] = None
+        eval_text_source: Optional[str] = None
         if prev_logits is not None:
             if is_wikitext and prev_aux is not None:
                 input_ids = prev_aux.get("input_ids") if isinstance(prev_aux, dict) else None
@@ -1567,21 +1730,23 @@ def run_learned_gate(
                 if input_ids is not None:
                     _accumulate_ppl(ppl_stats, prev_logits, input_ids, pad_token_id, special_mask)
             final_tokens, final_margins = logits_argmax_and_margin(prev_logits)
-            decoded_text = engine.decode_tokens(final_tokens).strip()
+            decoded_text = _safe_decode(engine, final_tokens)
+            diffusion_text = decoded_text
+            eval_text_val: Optional[str] = None
+            if (is_lambada or is_gsm8k) and labels is not None and prompt_idx < len(labels):
+                eval_text_val, eval_text_source = _evaluation_text_from_diffusion(
+                    diffusion_text, prompt, engine, gen_max_new
+                )
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = decoded_text
-                if not gen_text:
-                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                gen_text = eval_text_val or ""
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = decoded_text
-                if not gen_text:
-                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text or ""))
+                gen_text = eval_text_val or ""
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
 
@@ -1596,6 +1761,7 @@ def run_learned_gate(
                     "prompt_length": len(prompt),
                     "prompt": prompt,
                     "decoded_text": decoded_text,
+                    "evaluation_text_source": eval_text_source,
                 },
             )
 
@@ -1800,23 +1966,26 @@ def run_adaptive(
                 if input_ids is not None:
                     _accumulate_ppl(ppl_stats, prev_logits, input_ids, pad_token_id, special_mask)
             tokens, margins = logits_argmax_and_margin(prev_logits)
-            decoded_text = engine.decode_tokens(tokens).strip()
+            decoded_text = _safe_decode(engine, tokens)
+            diffusion_text = decoded_text
             final_tokens = tokens
             final_margins = margins
+            eval_text_source: Optional[str] = None
+            eval_text_val: Optional[str] = None
+            if (is_lambada or is_gsm8k) and labels is not None and prompt_idx < len(labels):
+                eval_text_val, eval_text_source = _evaluation_text_from_diffusion(
+                    diffusion_text, prompt, engine, gen_max_new
+                )
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
-                gen_text = decoded_text
-                if not gen_text:
-                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
+                gen_text = eval_text_val or ""
                 pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
                 gold_ans = labels[prompt_idx]
-                gen_text = decoded_text
-                if not gen_text:
-                    gen_text = _generate_text(engine, _maybe_chat_wrap(engine, prompt), max_new=gen_max_new)
-                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text or ""))
+                gen_text = eval_text_val or ""
+                pred_ans = _normalize_gsm_answer(_extract_gsm_answer(gen_text))
                 if pred_ans == _normalize_gsm_answer(str(gold_ans)):
                     gsm_correct += 1
         nominal_steps = float(num_steps)

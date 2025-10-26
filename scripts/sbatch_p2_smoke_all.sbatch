@@ -39,11 +39,19 @@ ENGINE=${ENGINE:-d2f}
 
 # spec: TASK:N_PROMPTS:PROFILE:RISK_DELTA:EXP
 declare -a DATASETS=(
-  "gsm8k:1000:balanced:0.010:gsm8k_rule"
+  "gsm8k:50:balanced:0.010:gsm8k_rule"
 )
 
 # 指定要對標的 P1 teacher 輸出資料夾（供 quantiles 使用）
-P1_ROOT=${P1_ROOT:-/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251006_002834}
+P1_DEFAULT_REFERENCE=/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251013_174729/reports/artifacts/features/teacher_features_20251013_174739.npz
+P1_REFERENCE=${P1_ROOT:-$P1_DEFAULT_REFERENCE}
+if [[ -f "$P1_REFERENCE" ]]; then
+  # 允許直接給定 features 檔案，往上回推到 P1 執行根目錄
+  P1_ROOT=$(dirname "$(dirname "$(dirname "$(dirname "$P1_REFERENCE")")")")
+else
+  P1_ROOT="$P1_REFERENCE"
+fi
+
 if [[ -d "$P1_ROOT" ]]; then
   # 選擇該資料夾底下最新一個 quantiles json
   mapfile -t P1_Q < <(find "$P1_ROOT/runs" -maxdepth 1 -name 'teacher_quantiles_*.json' -print 2>/dev/null | LC_ALL=C sort)
