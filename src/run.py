@@ -161,19 +161,63 @@ def synthetic_prompts(num_prompts: int) -> List[str]:
     return prompts
 
 
-def format_gsm8k_prompt_cot(question: str) -> str:
-    """0-shot CoT style prompt for GSM8K.
+_GSM8K_FEWSHOT_EXAMPLES: List[Tuple[str, str, str]] = [
+    (
+        "There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?",
+        "There are 15 trees originally. Then there were 21 trees after some more were planted. So there must have been 21 - 15 = 6. The answer is 6.",
+        "6",
+    ),
+    (
+        "If there are 3 cars in the parking lot and 2 more cars arrive, how many cars are in the parking lot?",
+        "There are originally 3 cars. 2 more cars arrive. 3 + 2 = 5. The answer is 5.",
+        "5",
+    ),
+    (
+        "Leah had 32 chocolates and her sister had 42. If they ate 35, how many pieces do they have left in total?",
+        "Originally, Leah had 32 chocolates. Her sister had 42. So in total they had 32 + 42 = 74. After eating 35, they had 74 - 35 = 39. The answer is 39.",
+        "39",
+    ),
+    (
+        "Jason had 20 lollipops. He gave Denny some lollipops. Now Jason has 12 lollipops. How many lollipops did Jason give to Denny?",
+        "Jason started with 20 lollipops. Then he had 12 after giving some to Denny. So he gave Denny 20 - 12 = 8. The answer is 8.",
+        "8",
+    ),
+    (
+        "Shawn has five toys. For Christmas, he got two toys each from his mom and dad. How many toys does he have now?",
+        "Shawn started with 5 toys. If he got 2 toys each from his mom and dad, then that is 4 more toys. 5 + 4 = 9. The answer is 9.",
+        "9",
+    ),
+    (
+        "There were nine computers in the server room. Five more computers were installed each day, from Monday to Thursday. How many computers are now in the server room?",
+        "There were originally 9 computers. For each of 4 days, 5 more computers were added. So 5 * 4 = 20 computers were added. 9 + 20 is 29. The answer is 29.",
+        "29",
+    ),
+    (
+        "Michael had 58 golf balls. On Tuesday, he lost 23 golf balls. On Wednesday, he lost 2 more. How many golf balls did he have at the end of Wednesday?",
+        "Michael started with 58 golf balls. After losing 23 on Tuesday, he had 58 - 23 = 35. After losing 2 more, he had 35 - 2 = 33 golf balls. The answer is 33.",
+        "33",
+    ),
+    (
+        "Olivia has $23. She bought five bagels for $3 each. How much money does she have left?",
+        "Olivia had 23 dollars. 5 bagels for 3 dollars each will be 5 x 3 = 15 dollars. So she has 23 - 15 dollars left. 23 - 15 is 8. The answer is 8.",
+        "8",
+    ),
+]
 
-    We ask the model to think step by step, then produce the final numeric answer
-    strictly in the form '#### <number>' on a new last line. This matches our
-    answer extraction and Dream's recommended eval style.
-    """
-    instruction = (
-        "You are a helpful math assistant. Solve the problem step by step. "
-        "After the reasoning, output the final answer on a new last line in the exact format '#### <number>' without any extra text."
+_GSM8K_FEWSHOT_PREFIX = (
+    "You are a helpful math assistant. Solve each problem step by step. "
+    "After reasoning, output the final answer on a new last line in the exact format '#### <number>' without any extra text.\n\n"
+    + "\n\n".join(
+        f"Q: {q}\nA: {r}\n#### {ans}"
+        for q, r, ans in _GSM8K_FEWSHOT_EXAMPLES
     )
+)
+
+
+def format_gsm8k_prompt_cot(question: str) -> str:
+    """Few-shot CoT prompt aligned with Dream's gsm8k_cot task."""
     return (
-        f"{instruction}\n\n"
+        f"{_GSM8K_FEWSHOT_PREFIX}\n\n"
         f"Q: {question}\n"
         f"A: Let's think step by step."
     )
@@ -378,44 +422,61 @@ def _safe_decode(engine: BaseEngine, token_ids: Sequence[int]) -> str:
         return ""
 
 
-def _dream_completion_and_prompt(
+def _completion_from_tokens(
     engine: BaseEngine,
-    base_prompt: str,
-    max_new: int,
-) -> Tuple[str, str]:
-    """Generate a completion for GSM8K-style prompts and return the completion text
-    along with the augmented prompt (base prompt + completion)."""
-    gen_prompt = _maybe_chat_wrap(engine, base_prompt)
-    completion_ids: Sequence[int] = []
-    completion_text = ""
-    try:
-        completion_ids = engine.greedy_generate(gen_prompt, max_new_tokens=max_new)
-        completion_text = engine.decode_tokens(completion_ids).strip()
-    except Exception:
-        completion_ids = []
-        completion_text = ""
-    if completion_text:
-        augmented_prompt = f"{base_prompt.rstrip()}\n\n{completion_text}"
-        return completion_text, augmented_prompt
-    return "", base_prompt
+    tokens: Sequence[int],
+    aux: Optional[Dict],
+) -> Tuple[str, Optional[int]]:
+    """Decode only the generated completion portion based on auxiliary input ids."""
+    if not tokens:
+        return "", None
+    prompt_len: Optional[int] = None
+    if isinstance(aux, dict):
+        ids = aux.get("input_ids")
+        if ids is not None:
+            if isinstance(ids, (list, tuple)):
+                if ids and isinstance(ids[0], (list, tuple)):
+                    prompt_len = len(ids[0])
+                else:
+                    prompt_len = len(ids)
+            else:
+                try:
+                    import numpy as np  # type: ignore
+                    if isinstance(ids, np.ndarray):
+                        prompt_len = int(ids.shape[-1] if ids.ndim > 1 else ids.shape[0])
+                except Exception:
+                    prompt_len = None
+    if prompt_len is not None and prompt_len < len(tokens):
+        completion_ids = tokens[prompt_len:]
+        if completion_ids:
+            return _safe_decode(engine, completion_ids), int(prompt_len)
+    return "", prompt_len
 
 
 def _evaluation_text_from_diffusion(
     diffusion_text: Optional[str],
-    prompt: str,
+    raw_prompt: str,
     engine: BaseEngine,
     max_new: int,
 ) -> Tuple[str, str]:
     """
     Returns the text used for scoring along with its source.
-    Source is 'diffusion' when the decoded diffusion text is non-empty,
-    otherwise 'greedy_fallback' after regenerating from the prompt.
+
+    - When `diffusion_text` is a non-empty string, it is treated as the eval text with
+      source tag 'diffusion'.
+    - Otherwise the function will regenerate a completion from the raw prompt using
+      the engine's greedy (diffusion) generator, tagging the source as 'greedy_fallback'
+      when the regenerated text is non-empty.
+    - If regeneration also fails, an empty string with source 'empty' is returned so
+      callers can handle the absence explicitly.
     """
     if diffusion_text and diffusion_text.strip():
         return diffusion_text.strip(), "diffusion"
-    regen_prompt = _maybe_chat_wrap(engine, prompt)
-    regenerated = _generate_text(engine, regen_prompt, max_new=max_new)
-    return regenerated.strip(), "greedy_fallback"
+    regen_prompt = _maybe_chat_wrap(engine, raw_prompt)
+    regenerated = _generate_text(engine, regen_prompt, max_new=max_new).strip()
+    if regenerated:
+        return regenerated, "greedy_fallback"
+    return "", "empty"
 
 def _maybe_chat_wrap(engine: BaseEngine, prompt: str) -> str:
     """If the engine supports chat templates (e.g., Dream Instruct), wrap the
@@ -587,15 +648,8 @@ def run_teacher(
     layer_dl2_stds: Dict[int, List[float]] = defaultdict(list)
 
     for prompt_idx, prompt in enumerate(prompts):
-        base_prompt = prompt
-        dream_completion: Optional[str] = None
-        if is_gsm8k:
-            completion_text, augmented_prompt = _dream_completion_and_prompt(engine, base_prompt, gen_max_new)
-            if completion_text:
-                dream_completion = completion_text
-                prompt = augmented_prompt
-        prompt_for_engine = prompt
-        state = engine.encode_prompt(prompt)
+        prompt_for_engine = _maybe_chat_wrap(engine, prompt)
+        state = engine.encode_prompt(prompt_for_engine)
         prev_hidden: Optional[List[np.ndarray]] = None
         prev_logits: Optional[np.ndarray] = None
         prev_aux: Optional[Dict] = None
@@ -799,16 +853,24 @@ def run_teacher(
             tokens, margins = logits_argmax_and_margin(prev_logits)
             checksum = float(np.sum(prev_logits)) if prev_logits.size else 0.0
             decoded_text = _safe_decode(engine, tokens)
-            diffusion_text = decoded_text
+            completion_text, prompt_len = _completion_from_tokens(engine, tokens, final_aux)
+            diffusion_text = completion_text if completion_text else decoded_text
+            diffusion_text = diffusion_text.strip() if diffusion_text else ""
+            diffusion_text_source = "completion" if completion_text else "logits"
             eval_text_val: Optional[str] = None
             eval_text_source: Optional[str] = None
-            if dream_completion:
-                eval_text_val = dream_completion
-                eval_text_source = "dream_completion"
-            elif (is_lambada or is_gsm8k) and labels is not None and prompt_idx < len(labels):
+            if (is_lambada or is_gsm8k) and labels is not None and prompt_idx < len(labels):
+                eval_input_text = diffusion_text
                 eval_text_val, eval_text_source = _evaluation_text_from_diffusion(
-                    diffusion_text, prompt, engine, gen_max_new
+                    eval_input_text,
+                    prompt,
+                    engine,
+                    gen_max_new,
                 )
+                if not eval_text_val:
+                    eval_text_val = diffusion_text
+                    if not eval_text_source:
+                        eval_text_source = "diffusion"
             gen_text_lbd = None
             pred_word = None
             gen_text_gsm = None
@@ -834,6 +896,13 @@ def run_teacher(
                 "logits_checksum": checksum,
             }
             record["diffusion_text"] = diffusion_text
+            record["diffusion_text_source"] = diffusion_text_source
+            if completion_text:
+                record["diffusion_completion"] = completion_text
+            if decoded_text != diffusion_text:
+                record["diffusion_raw_text"] = decoded_text
+            if prompt_len is not None:
+                record["diffusion_prompt_len"] = int(prompt_len)
             if is_lambada:
                 record["gen_text_lambada"] = gen_text_lbd
                 if eval_text_source is not None:
@@ -844,8 +913,6 @@ def run_teacher(
                 if eval_text_source is not None:
                     record["gen_text_gsm8k_source"] = eval_text_source
                 record["pred_ans"] = pred_ans
-                if dream_completion:
-                    record["dream_completion_text"] = dream_completion
             teacher_outputs_file.write(json.dumps(record) + "\n")
         if capture_trace:
             first_prompt_step_trace = prompt_step_trace
@@ -1181,6 +1248,9 @@ def run_rule_gate(
 
     gate = RuleGate(cfg)
     calibrator_params = calibrator_cfg or {}
+    is_wikitext = task_name == "wikitext"
+    is_lambada = task_name == "lambada"
+    is_gsm8k = task_name == "gsm8k"
     calibrator = StepwiseConformalCalibrator(
         delta=risk_delta,
         num_steps=num_steps,
@@ -1209,9 +1279,7 @@ def run_rule_gate(
     sampler = GPUUtilSampler(interval_sec=0.5)
     sampler.start()
 
-    is_wikitext = task_name == "wikitext"
-    is_lambada = task_name == "lambada"
-    is_gsm8k = task_name == "gsm8k"
+    # Flags already computed above
     ppl_stats: Dict[str, float] = {"nll_sum": 0.0, "token_count": 0.0}
     lambada_correct = 0
     lambada_total = len(labels) if is_lambada and labels is not None else 0
@@ -1219,13 +1287,8 @@ def run_rule_gate(
     gsm_total = len(labels) if is_gsm8k and labels is not None else 0
 
     for prompt_idx, prompt in enumerate(prompts):
-        dream_completion: Optional[str] = None
-        if is_gsm8k:
-            completion_text, augmented_prompt = _dream_completion_and_prompt(engine, prompt, gen_max_new)
-            if completion_text:
-                dream_completion = completion_text
-                prompt = augmented_prompt
-        state = engine.encode_prompt(prompt)
+        prompt_for_engine = _maybe_chat_wrap(engine, prompt)
+        state = engine.encode_prompt(prompt_for_engine)
         prev_hidden: Optional[List[np.ndarray]] = None
         prev_logits: Optional[np.ndarray] = None
         prev_aux: Optional[Dict] = None
@@ -1388,6 +1451,10 @@ def run_rule_gate(
         final_tokens: Optional[List[int]] = None
         final_margins: Optional[List[float]] = None
         decoded_text: Optional[str] = None
+        completion_text_adapt: Optional[str] = None
+        completion_prompt_len_adapt: Optional[int] = None
+        completion_text_rule: Optional[str] = None
+        completion_prompt_len: Optional[int] = None
         if prev_logits is not None:
             if is_wikitext and prev_aux is not None:
                 input_ids = prev_aux.get("input_ids") if isinstance(prev_aux, dict) else None
@@ -1397,16 +1464,24 @@ def run_rule_gate(
                     _accumulate_ppl(ppl_stats, prev_logits, input_ids, pad_token_id, special_mask)
             final_tokens, final_margins = logits_argmax_and_margin(prev_logits)
             decoded_text = _safe_decode(engine, final_tokens)
-            diffusion_text = decoded_text
+            completion_text_rule, completion_prompt_len = _completion_from_tokens(engine, final_tokens, prev_aux)
+            diffusion_text = completion_text_rule if completion_text_rule else decoded_text
+            diffusion_text = diffusion_text.strip() if diffusion_text else ""
+            diffusion_text_source = "completion" if completion_text_rule else "logits"
             eval_text_val: Optional[str] = None
             eval_text_source: Optional[str] = None
-            if dream_completion:
-                eval_text_val = dream_completion
-                eval_text_source = "dream_completion"
-            elif (is_lambada or is_gsm8k) and labels is not None and prompt_idx < len(labels):
+            if (is_lambada or is_gsm8k) and labels is not None and prompt_idx < len(labels):
+                eval_input_text = diffusion_text
                 eval_text_val, eval_text_source = _evaluation_text_from_diffusion(
-                    diffusion_text, prompt, engine, gen_max_new
+                    eval_input_text,
+                    prompt,
+                    engine,
+                    gen_max_new,
                 )
+                if not eval_text_val:
+                    eval_text_val = diffusion_text
+                    if not eval_text_source:
+                        eval_text_source = "diffusion"
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
                 gen_text = eval_text_val or ""
@@ -1452,6 +1527,10 @@ def run_rule_gate(
                     "prompt_length": len(prompt),
                     "prompt": prompt,
                     "decoded_text": decoded_text,
+                    "diffusion_text": diffusion_text,
+                    "diffusion_text_source": diffusion_text_source,
+                    "completion_text": completion_text_rule,
+                    "completion_prompt_len": completion_prompt_len,
                     "evaluation_text_source": eval_text_source,
                 },
             )
@@ -1592,6 +1671,9 @@ def run_learned_gate(
     sampler = GPUUtilSampler(interval_sec=0.5)
     sampler.start()
     calibrator_params = calibrator_cfg or {}
+    is_wikitext = task_name == "wikitext"
+    is_lambada = task_name == "lambada"
+    is_gsm8k = task_name == "gsm8k"
     calibrator = StepwiseConformalCalibrator(
         delta=risk_delta,
         num_steps=num_steps,
@@ -1607,9 +1689,7 @@ def run_learned_gate(
     risk_threshold_history: List[float] = []
     delta_violation_history: List[float] = []
 
-    is_wikitext = task_name == "wikitext"
-    is_lambada = task_name == "lambada"
-    is_gsm8k = task_name == "gsm8k"
+    # Flags computed above
     ppl_stats: Dict[str, float] = {"nll_sum": 0.0, "token_count": 0.0}
     lambada_correct = 0
     lambada_total = len(labels) if is_lambada and labels is not None else 0
@@ -1617,13 +1697,8 @@ def run_learned_gate(
     gsm_total = len(labels) if is_gsm8k and labels is not None else 0
 
     for prompt_idx, prompt in enumerate(prompts):
-        dream_completion: Optional[str] = None
-        if is_gsm8k:
-            completion_text, augmented_prompt = _dream_completion_and_prompt(engine, prompt, gen_max_new)
-            if completion_text:
-                dream_completion = completion_text
-                prompt = augmented_prompt
-        state = engine.encode_prompt(prompt)
+        prompt_for_engine = _maybe_chat_wrap(engine, prompt)
+        state = engine.encode_prompt(prompt_for_engine)
         prev_hidden: Optional[List[np.ndarray]] = None
         prev_logits: Optional[np.ndarray] = None
         prev_aux: Optional[Dict] = None
@@ -1772,6 +1847,8 @@ def run_learned_gate(
         final_margins: Optional[List[float]] = None
         decoded_text: Optional[str] = None
         eval_text_source: Optional[str] = None
+        completion_text_learned: Optional[str] = None
+        completion_prompt_len_learned: Optional[int] = None
         if prev_logits is not None:
             if is_wikitext and prev_aux is not None:
                 input_ids = prev_aux.get("input_ids") if isinstance(prev_aux, dict) else None
@@ -1781,15 +1858,23 @@ def run_learned_gate(
                     _accumulate_ppl(ppl_stats, prev_logits, input_ids, pad_token_id, special_mask)
             final_tokens, final_margins = logits_argmax_and_margin(prev_logits)
             decoded_text = _safe_decode(engine, final_tokens)
-            diffusion_text = decoded_text
+            completion_text_learned, completion_prompt_len_learned = _completion_from_tokens(engine, final_tokens, prev_aux)
+            diffusion_text = completion_text_learned if completion_text_learned else decoded_text
+            diffusion_text = diffusion_text.strip() if diffusion_text else ""
+            diffusion_text_source = "completion" if completion_text_learned else "logits"
             eval_text_val: Optional[str] = None
-            if dream_completion:
-                eval_text_val = dream_completion
-                eval_text_source = "dream_completion"
-            elif (is_lambada or is_gsm8k) and labels is not None and prompt_idx < len(labels):
+            if (is_lambada or is_gsm8k) and labels is not None and prompt_idx < len(labels):
+                eval_input_text = diffusion_text
                 eval_text_val, eval_text_source = _evaluation_text_from_diffusion(
-                    diffusion_text, prompt, engine, gen_max_new
+                    eval_input_text,
+                    prompt,
+                    engine,
+                    gen_max_new,
                 )
+                if not eval_text_val:
+                    eval_text_val = diffusion_text
+                    if not eval_text_source:
+                        eval_text_source = "diffusion"
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
                 gen_text = eval_text_val or ""
@@ -1814,6 +1899,10 @@ def run_learned_gate(
                     "prompt_length": len(prompt),
                     "prompt": prompt,
                     "decoded_text": decoded_text,
+                    "diffusion_text": diffusion_text,
+                    "diffusion_text_source": diffusion_text_source,
+                    "completion_text": completion_text_learned,
+                    "completion_prompt_len": completion_prompt_len_learned,
                     "evaluation_text_source": eval_text_source,
                 },
             )
@@ -1939,13 +2028,8 @@ def run_adaptive(
     gsm_total = len(labels) if is_gsm8k and labels is not None else 0
 
     for prompt_idx, prompt in enumerate(prompts):
-        dream_completion: Optional[str] = None
-        if is_gsm8k:
-            completion_text, augmented_prompt = _dream_completion_and_prompt(engine, prompt, gen_max_new)
-            if completion_text:
-                dream_completion = completion_text
-                prompt = augmented_prompt
-        state = engine.encode_prompt(prompt)
+        prompt_for_engine = _maybe_chat_wrap(engine, prompt)
+        state = engine.encode_prompt(prompt_for_engine)
         prev_hidden: Optional[List[np.ndarray]] = None
         prev_logits: Optional[np.ndarray] = None
         prev_aux: Optional[Dict] = None
@@ -2026,18 +2110,26 @@ def run_adaptive(
                     _accumulate_ppl(ppl_stats, prev_logits, input_ids, pad_token_id, special_mask)
             tokens, margins = logits_argmax_and_margin(prev_logits)
             decoded_text = _safe_decode(engine, tokens)
-            diffusion_text = decoded_text
+            completion_text_adapt, completion_prompt_len_adapt = _completion_from_tokens(engine, tokens, prev_aux)
+            diffusion_text = completion_text_adapt if completion_text_adapt else decoded_text
+            diffusion_text = diffusion_text.strip() if diffusion_text else ""
+            diffusion_text_source = "completion" if completion_text_adapt else "logits"
             final_tokens = tokens
             final_margins = margins
             eval_text_source: Optional[str] = None
             eval_text_val: Optional[str] = None
-            if dream_completion:
-                eval_text_val = dream_completion
-                eval_text_source = "dream_completion"
-            elif (is_lambada or is_gsm8k) and labels is not None and prompt_idx < len(labels):
+            if (is_lambada or is_gsm8k) and labels is not None and prompt_idx < len(labels):
+                eval_input_text = diffusion_text
                 eval_text_val, eval_text_source = _evaluation_text_from_diffusion(
-                    diffusion_text, prompt, engine, gen_max_new
+                    eval_input_text,
+                    prompt,
+                    engine,
+                    gen_max_new,
                 )
+                if not eval_text_val:
+                    eval_text_val = diffusion_text
+                    if not eval_text_source:
+                        eval_text_source = "diffusion"
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
                 gen_text = eval_text_val or ""
@@ -2069,6 +2161,10 @@ def run_adaptive(
                     "prompt_length": len(prompt),
                     "prompt": prompt,
                     "decoded_text": decoded_text,
+                    "diffusion_text": diffusion_text,
+                    "diffusion_text_source": diffusion_text_source,
+                    "completion_text": completion_text_adapt,
+                    "completion_prompt_len": completion_prompt_len_adapt,
                     "stride_trace": prompt_stride,
                     "lte_trace": prompt_lte,
                     "risk_trace": prompt_risk,

@@ -61,7 +61,7 @@ mkdir -p logs models/gates
 CONFIG_PATH=${CONFIG_PATH:-configs/p3_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 WEIGHTS_OUT=${WEIGHTS_OUT:-models/gates/learned_gate_latest.npz}
-FEATURE_OVERRIDE_DEFAULT=/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251026_234728/reports/artifacts/features/teacher_features_20251026_234836.npz
+FEATURE_OVERRIDE_DEFAULT=/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251027_051504/reports/artifacts/features/teacher_features_20251027_051617.npz
 FEATURE_OVERRIDE=${FEATURE_OVERRIDE:-$FEATURE_OVERRIDE_DEFAULT}
 TRAIN_FEATURES=""
 if [[ -f "$FEATURE_OVERRIDE" ]]; then

@@ -246,15 +246,16 @@ class D2FDreamEngine(BaseEngine):
         # Prefer the Dream diffusion_generate API if available
         if hasattr(self._model, "diffusion_generate"):
             try:
+                diffusion_steps = max(256, int(max_new_tokens))
                 with torch.no_grad():
                     out = self._model.diffusion_generate(
                         input_ids,
                         attention_mask=attn_mask,
                         max_new_tokens=int(max_new_tokens),
-                        steps=int(max_new_tokens),
+                        steps=diffusion_steps,
                         # dtype intentionally omitted; rely on model default
-                        temperature=0.1,
-                        top_p=0.9,
+                        temperature=0.0,
+                        top_p=0.95,
                         alg="entropy",
                         return_dict_in_generate=True,
                         output_history=False,
