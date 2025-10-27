@@ -464,19 +464,13 @@ def _evaluation_text_from_diffusion(
 
     - When `diffusion_text` is a non-empty string, it is treated as the eval text with
       source tag 'diffusion'.
-    - Otherwise the function will regenerate a completion from the raw prompt using
-      the engine's greedy (diffusion) generator, tagging the source as 'greedy_fallback'
-      when the regenerated text is non-empty.
-    - If regeneration also fails, an empty string with source 'empty' is returned so
-      callers can handle the absence explicitly.
+    - Otherwise (no diffusion text available) the caller receives an empty string with
+      source tag 'missing' so each mode's behaviour is reflected faithfully without a
+      shared fallback generation.
     """
     if diffusion_text and diffusion_text.strip():
         return diffusion_text.strip(), "diffusion"
-    regen_prompt = _maybe_chat_wrap(engine, raw_prompt)
-    regenerated = _generate_text(engine, regen_prompt, max_new=max_new).strip()
-    if regenerated:
-        return regenerated, "greedy_fallback"
-    return "", "empty"
+    return "", "missing"
 
 def _maybe_chat_wrap(engine: BaseEngine, prompt: str) -> str:
     """If the engine supports chat templates (e.g., Dream Instruct), wrap the
@@ -878,7 +872,7 @@ def run_teacher(
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
                 gen_text_lbd = eval_text_val or ""
-                pred_word = _extract_last_word(gen_text_lbd.split()[0] if gen_text_lbd else "")
+                pred_word = _extract_last_word(gen_text_lbd)
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
@@ -1485,7 +1479,7 @@ def run_rule_gate(
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
                 gen_text = eval_text_val or ""
-                pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
+                pred_word = _extract_last_word(gen_text)
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
@@ -1878,7 +1872,7 @@ def run_learned_gate(
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
                 gen_text = eval_text_val or ""
-                pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
+                pred_word = _extract_last_word(gen_text)
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):
@@ -2133,7 +2127,7 @@ def run_adaptive(
             if is_lambada and labels is not None and prompt_idx < len(labels):
                 gold_word = labels[prompt_idx]
                 gen_text = eval_text_val or ""
-                pred_word = _extract_last_word(gen_text.split()[0] if gen_text else "")
+                pred_word = _extract_last_word(gen_text)
                 if _normalize_word(pred_word) == _normalize_word(str(gold_word)):
                     lambada_correct += 1
             if is_gsm8k and labels is not None and prompt_idx < len(labels):

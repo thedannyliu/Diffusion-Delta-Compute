@@ -257,6 +257,8 @@ class D2FDreamEngine(BaseEngine):
                         temperature=0.0,
                         top_p=0.95,
                         alg="entropy",
+                        add_bos_token=True,
+                        escape_until=True,
                         return_dict_in_generate=True,
                         output_history=False,
                     )
