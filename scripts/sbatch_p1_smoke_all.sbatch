@@ -9,23 +9,48 @@
 # Prefer PyTorch wheel-bundled CUDA libs; keep module load but let our LD_LIBRARY_PATH take precedence later
 module load cuda/12.1 || true
 
-CONDA_ROOT=${CONDA_ROOT:-$HOME/miniconda3}
-if [[ -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]]; then
-  # shellcheck disable=SC1090
-  source "$CONDA_ROOT/etc/profile.d/conda.sh"
-elif command -v conda >/dev/null 2>&1; then
-  eval "$(conda shell.bash hook)"
-else
-  echo "[ERROR] conda initialization script not found; set CONDA_ROOT or install Miniconda." >&2
+# Unset PYTHONPATH to avoid conflicts
+unset PYTHONPATH
+
+# Activate conda
+DEFAULT_CONDA_ROOT="/usr/local/pace-apps/manual/packages/anaconda3/2023.03"
+DEFAULT_CONDA_ENV="/storage/ice1/2/9/eliu354/conda_envs/dcllm"
+declare -a CONDA_CANDIDATES=()
+if [[ -n "${CONDA_ROOT:-}" ]]; then
+  CONDA_CANDIDATES+=("$CONDA_ROOT")
+fi
+CONDA_CANDIDATES+=("$DEFAULT_CONDA_ROOT" "$HOME/miniconda3")
+for candidate in "${CONDA_CANDIDATES[@]}"; do
+  if [[ -f "$candidate/etc/profile.d/conda.sh" ]] && [[ -x "$candidate/bin/conda" ]] && "$candidate/bin/conda" --version >/dev/null 2>&1; then
+    CONDA_ROOT="$candidate"
+    # shellcheck disable=SC1090
+    source "$candidate/etc/profile.d/conda.sh"
+    break
+  fi
+done
+if [[ -z "${CONDA_ROOT:-}" ]]; then
+  if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+  else
+    echo "[ERROR] conda initialization script not found; export CONDA_ROOT or install Miniconda." >&2
+    exit 1
+  fi
+fi
+
+CONDA_ENV_TARGET=${CONDA_ENV_TARGET:-}
+if [[ -z "$CONDA_ENV_TARGET" ]]; then
+  if [[ -d "$DEFAULT_CONDA_ENV" ]]; then
+    CONDA_ENV_TARGET="$DEFAULT_CONDA_ENV"
+  else
+    CONDA_ENV_TARGET="dcllm"
+  fi
+fi
+
+if ! conda activate "$CONDA_ENV_TARGET" >/dev/null 2>&1; then
+  echo "[ERROR] failed to activate conda environment '$CONDA_ENV_TARGET'." >&2
   exit 1
 fi
 
-if ! conda activate dcllm >/dev/null 2>&1; then
-  echo "[ERROR] failed to activate conda environment 'dcllm'." >&2
-  exit 1
-fi
-
-export PYTHON="${PYTHON:-$(command -v python)}"
 export WANDB_MODE=${WANDB_MODE:-online}
 # Skip torchvision entirely to avoid import-time issues in transformers
 export TRANSFORMERS_NO_TORCHVISION=1
@@ -36,18 +61,20 @@ if [[ -n "$CONDA_PREFIX" ]]; then
 fi
 mkdir -p logs
 
+export PYTHON="/storage/ice1/2/9/eliu354/conda_envs/dcllm/bin/python"
+
 CONFIG_PATH=${CONFIG_PATH:-configs/p1_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 DATA_ROOT=${DATA_ROOT:-}
 
 declare -a DATASETS=(
-  "gsm8k:50:gsm8k_smoke"
+  "gsm8k:10:gsm8k_smoke"
 )
 
-echo "[sbatch] P1 smoke triplet starting (engine=${ENGINE})"
+echo "[sbatch] P1 smoke triplet starting (engine=${ENGINE}) from $(realpath "$0")"
 for spec in "${DATASETS[@]}"; do
   IFS=':' read -r TASK N EPNAME <<<"$spec"
-  echo "[sbatch][P1] Full run task=${TASK} n=${N}"
+echo "[sbatch][P1] Full run task=${TASK} n=${N} (CONDA_ROOT=${CONDA_ROOT:-unset} CONDA_PREFIX=${CONDA_PREFIX:-unset} PYTHON=$(command -v python))"
   srun --exclusive -N1 -n1 \
     bash scripts/run_p1_teacher.sh "$CONFIG_PATH" \
       --engine "$ENGINE" \

@@ -9,23 +9,47 @@
 
 module load cuda/12.1 || true
 
-CONDA_ROOT=${CONDA_ROOT:-$HOME/miniconda3}
-if [[ -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]]; then
-  # shellcheck disable=SC1090
-  source "$CONDA_ROOT/etc/profile.d/conda.sh"
-elif command -v conda >/dev/null 2>&1; then
-  eval "$(conda shell.bash hook)"
-else
-  echo "[ERROR] conda initialization script not found; set CONDA_ROOT or install Miniconda." >&2
+unset PYTHONPATH
+
+DEFAULT_CONDA_ROOT="/usr/local/pace-apps/manual/packages/anaconda3/2023.03"
+DEFAULT_CONDA_ENV="/storage/ice1/2/9/eliu354/conda_envs/dcllm"
+declare -a CONDA_CANDIDATES=()
+if [[ -n "${CONDA_ROOT:-}" ]]; then
+  CONDA_CANDIDATES+=("$CONDA_ROOT")
+fi
+CONDA_CANDIDATES+=("$DEFAULT_CONDA_ROOT" "$HOME/miniconda3")
+for candidate in "${CONDA_CANDIDATES[@]}"; do
+  if [[ -f "$candidate/etc/profile.d/conda.sh" ]] && [[ -x "$candidate/bin/conda" ]] && "$candidate/bin/conda" --version >/dev/null 2>&1; then
+    CONDA_ROOT="$candidate"
+    # shellcheck disable=SC1090
+    source "$candidate/etc/profile.d/conda.sh"
+    break
+  fi
+done
+if [[ -z "${CONDA_ROOT:-}" ]]; then
+  if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+  else
+    echo "[ERROR] conda initialization script not found; export CONDA_ROOT or install Miniconda." >&2
+    exit 1
+  fi
+fi
+
+CONDA_ENV_TARGET=${CONDA_ENV_TARGET:-}
+if [[ -z "$CONDA_ENV_TARGET" ]]; then
+  if [[ -d "$DEFAULT_CONDA_ENV" ]]; then
+    CONDA_ENV_TARGET="$DEFAULT_CONDA_ENV"
+  else
+    CONDA_ENV_TARGET="dcllm"
+  fi
+fi
+
+if ! conda activate "$CONDA_ENV_TARGET" >/dev/null 2>&1; then
+  echo "[ERROR] failed to activate conda environment '$CONDA_ENV_TARGET'." >&2
   exit 1
 fi
 
-if ! conda activate dcllm >/dev/null 2>&1; then
-  echo "[ERROR] failed to activate conda environment 'dcllm'." >&2
-  exit 1
-fi
-
-export PYTHON="${PYTHON:-$(command -v python)}"
+export PYTHON="/storage/ice1/2/9/eliu354/conda_envs/dcllm/bin/python"
 export WANDB_MODE=${WANDB_MODE:-online}
 export TRANSFORMERS_NO_TORCHVISION=1
 if [[ -n "$CONDA_PREFIX" ]]; then
@@ -39,11 +63,11 @@ ENGINE=${ENGINE:-d2f}
 
 # spec: TASK:N_PROMPTS:PROFILE:RISK_DELTA:EXP
 declare -a DATASETS=(
-  "gsm8k:50:balanced:0.010:gsm8k_rule"
+  "gsm8k:10:balanced:0.010:gsm8k_rule"
 )
 
 # 指定要對標的 P1 teacher 輸出資料夾（供 quantiles 使用）
-P1_DEFAULT_REFERENCE=/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251013_174729/reports/artifacts/features/teacher_features_20251013_174739.npz
+P1_DEFAULT_REFERENCE=/home/hice1/2/9/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251026_234728/reports/artifacts/features/teacher_features_20251026_234836.npz
 P1_REFERENCE=${P1_ROOT:-$P1_DEFAULT_REFERENCE}
 if [[ -f "$P1_REFERENCE" ]]; then
   # 允許直接給定 features 檔案，往上回推到 P1 執行根目錄

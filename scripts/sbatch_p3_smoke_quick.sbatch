@@ -8,23 +8,10 @@
 
 module load cuda/12.1 || true
 
-CONDA_ROOT=${CONDA_ROOT:-$HOME/miniconda3}
-if [[ -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]]; then
-  # shellcheck disable=SC1090
-  source "$CONDA_ROOT/etc/profile.d/conda.sh"
-elif command -v conda >/dev/null 2>&1; then
-  eval "$(conda shell.bash hook)"
-else
-  echo "[ERROR] conda initialization script not found; set CONDA_ROOT or install Miniconda." >&2
-  exit 1
-fi
+# Activate conda
+source /storage/ice1/2/9/eliu354/miniconda3/etc/profile.d/conda.sh
+conda activate dcllm
 
-if ! conda activate dcllm >/dev/null 2>&1; then
-  echo "[ERROR] failed to activate conda environment 'dcllm'." >&2
-  exit 1
-fi
-
-export PYTHON="${PYTHON:-$(command -v python)}"
 export WANDB_MODE=${WANDB_MODE:-disabled}
 export TRANSFORMERS_NO_TORCHVISION=1
 if [[ -n "$CONDA_PREFIX" ]]; then

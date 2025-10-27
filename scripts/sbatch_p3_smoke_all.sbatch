@@ -9,23 +9,47 @@
 
 module load cuda/12.1 || true
 
-CONDA_ROOT=${CONDA_ROOT:-$HOME/miniconda3}
-if [[ -f "$CONDA_ROOT/etc/profile.d/conda.sh" ]]; then
-  # shellcheck disable=SC1090
-  source "$CONDA_ROOT/etc/profile.d/conda.sh"
-elif command -v conda >/dev/null 2>&1; then
-  eval "$(conda shell.bash hook)"
-else
-  echo "[ERROR] conda initialization script not found; set CONDA_ROOT or install Miniconda." >&2
+unset PYTHONPATH
+
+DEFAULT_CONDA_ROOT="/usr/local/pace-apps/manual/packages/anaconda3/2023.03"
+DEFAULT_CONDA_ENV="/storage/ice1/2/9/eliu354/conda_envs/dcllm"
+declare -a CONDA_CANDIDATES=()
+if [[ -n "${CONDA_ROOT:-}" ]]; then
+  CONDA_CANDIDATES+=("$CONDA_ROOT")
+fi
+CONDA_CANDIDATES+=("$DEFAULT_CONDA_ROOT" "$HOME/miniconda3")
+for candidate in "${CONDA_CANDIDATES[@]}"; do
+  if [[ -f "$candidate/etc/profile.d/conda.sh" ]] && [[ -x "$candidate/bin/conda" ]] && "$candidate/bin/conda" --version >/dev/null 2>&1; then
+    CONDA_ROOT="$candidate"
+    # shellcheck disable=SC1090
+    source "$candidate/etc/profile.d/conda.sh"
+    break
+  fi
+done
+if [[ -z "${CONDA_ROOT:-}" ]]; then
+  if command -v conda >/dev/null 2>&1; then
+    eval "$(conda shell.bash hook)"
+  else
+    echo "[ERROR] conda initialization script not found; export CONDA_ROOT or install Miniconda." >&2
+    exit 1
+  fi
+fi
+
+CONDA_ENV_TARGET=${CONDA_ENV_TARGET:-}
+if [[ -z "$CONDA_ENV_TARGET" ]]; then
+  if [[ -d "$DEFAULT_CONDA_ENV" ]]; then
+    CONDA_ENV_TARGET="$DEFAULT_CONDA_ENV"
+  else
+    CONDA_ENV_TARGET="dcllm"
+  fi
+fi
+
+if ! conda activate "$CONDA_ENV_TARGET" >/dev/null 2>&1; then
+  echo "[ERROR] failed to activate conda environment '$CONDA_ENV_TARGET'." >&2
   exit 1
 fi
 
-if ! conda activate dcllm >/dev/null 2>&1; then
-  echo "[ERROR] failed to activate conda environment 'dcllm'." >&2
-  exit 1
-fi
-
-export PYTHON="${PYTHON:-$(command -v python)}"
+export PYTHON="/storage/ice1/2/9/eliu354/conda_envs/dcllm/bin/python"
 export WANDB_MODE=${WANDB_MODE:-online}
 export TRANSFORMERS_NO_TORCHVISION=1
 if [[ -n "$CONDA_PREFIX" ]]; then
@@ -37,31 +61,48 @@ mkdir -p logs models/gates
 CONFIG_PATH=${CONFIG_PATH:-configs/p3_smoke.yaml}
 ENGINE=${ENGINE:-d2f}
 WEIGHTS_OUT=${WEIGHTS_OUT:-models/gates/learned_gate_latest.npz}
-# 指定 P1 teacher 輸出根目錄（供 features 使用）
-P1_DEFAULT_REFERENCE=/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251013_174729/reports/artifacts/features/teacher_features_20251013_174739.npz
-P1_REFERENCE=${P1_ROOT:-$P1_DEFAULT_REFERENCE}
-if [[ -f "$P1_REFERENCE" ]]; then
-  # 允許直接給定 features 檔案，往上回推到 P1 執行根目錄
-  P1_ROOT=$(dirname "$(dirname "$(dirname "$(dirname "$P1_REFERENCE")")")")
+FEATURE_OVERRIDE_DEFAULT=/home/hice1/2/9/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251026_234728/reports/artifacts/features/teacher_features_20251026_234836.npz
+FEATURE_OVERRIDE=${FEATURE_OVERRIDE:-$FEATURE_OVERRIDE_DEFAULT}
+TRAIN_FEATURES=""
+if [[ -f "$FEATURE_OVERRIDE" ]]; then
+  TRAIN_FEATURES="$FEATURE_OVERRIDE"
+  echo "[P3] Using explicit teacher features: $TRAIN_FEATURES"
 else
-  P1_ROOT="$P1_REFERENCE"
+  # 指定 P1 teacher 輸出根目錄（供 features 使用）
+  P1_DEFAULT_REFERENCE=/home/hice1/eliu354/scratch/Projects/Diffusion-Delta-Compute/reports/P1/teacher/d2f/gsm8k_smoke_20251013_174729/reports/artifacts/features/teacher_features_20251013_174739.npz
+  P1_REFERENCE=${P1_ROOT:-$P1_DEFAULT_REFERENCE}
+  if [[ -f "$P1_REFERENCE" ]]; then
+    # 允許直接給定 features 檔案，往上回推到 P1 執行根目錄
+    P1_ROOT=$(dirname "$(dirname "$(dirname "$(dirname "$P1_REFERENCE")")")")
+  else
+    P1_ROOT="$P1_REFERENCE"
+  fi
+  if [[ -d "$P1_ROOT" ]]; then
+    mapfile -t F < <(find "$P1_ROOT/reports/artifacts/features" -maxdepth 1 -name "teacher_features_*.npz" -print 2>/dev/null | LC_ALL=C sort)
+    if (( ${#F[@]} > 0 )); then
+      TRAIN_FEATURES="${F[-1]}"
+      echo "[P3] Located fallback teacher features: $TRAIN_FEATURES"
+    fi
+  fi
+fi
+if [[ -z "$TRAIN_FEATURES" ]]; then
+  echo "[P3] ERROR: 無法找到 teacher_features_*.npz；請設定 FEATURE_OVERRIDE 或 P1_ROOT。" >&2
+  exit 1
 fi
 DATA_ROOT=${DATA_ROOT:-}
 
 # Train once using P1 features, then evaluate per dataset.
-echo "[sbatch] P3 training learned gate from P1 features under: ${P1_ROOT}"
-srun --exclusive -N1 -n1 bash -lc '
-  set -euo pipefail
-  PYTHON=${PYTHON:-python}
-  if [[ ! -d "'"$P1_ROOT"'" ]]; then echo "[P3] ERROR: P1_ROOT='"$P1_ROOT"' not found." >&2; exit 1; fi
-  mapfile -t F < <(find "'"$P1_ROOT"'/reports/artifacts/features" -maxdepth 1 -name "teacher_features_*.npz" -print 2>/dev/null | LC_ALL=C sort)
-  if (( ${#F[@]} == 0 )); then echo "[P3] ERROR: No teacher_features_*.npz under '"$P1_ROOT"'." >&2; exit 1; fi
-  echo "[learned_gate] Using features: ${F[-1]}"
-  "$PYTHON" -m src.learned.train_gate --features "${F[-1]}" --out "'"$WEIGHTS_OUT"'" --epochs "${TRAIN_EPOCHS:-8}" --batch_size "${TRAIN_BATCH:-1024}" --lr "${TRAIN_LR:-1e-3}"
-'
+echo "[sbatch] P3 training learned gate with features: ${TRAIN_FEATURES}"
+srun --exclusive -N1 -n1 \
+  "$PYTHON" -m src.learned.train_gate \
+    --features "$TRAIN_FEATURES" \
+    --out "$WEIGHTS_OUT" \
+    --epochs "${TRAIN_EPOCHS:-8}" \
+    --batch_size "${TRAIN_BATCH:-1024}" \
+    --lr "${TRAIN_LR:-1e-3}"
 
 declare -a DATASETS=(
-  "gsm8k:50:gsm8k_learned"
+  "gsm8k:10:gsm8k_learned"
 )
 
 for spec in "${DATASETS[@]}"; do

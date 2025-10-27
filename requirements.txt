@@ -1,6 +1,6 @@
 # Core
 # Use CUDA-specific wheels for torch if needed
-torch==2.2.2
+torch
 transformers==4.44.2
 datasets==2.21.0
 accelerate==0.33.0
