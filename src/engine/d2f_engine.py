@@ -203,15 +203,18 @@ class D2FDreamEngine(BaseEngine):
             logits_t = (h_last @ self._fallback_proj).numpy()
 
         # Apply per-token freeze by reusing previous step values where compute_mask is False
-        if compute_mask is not None and state.prev_hidden_by_layer is not None and state.prev_logits is not None:
-            mask = compute_mask.astype(bool)
-            for li in range(len(layers)):
-                prev_layer = state.prev_hidden_by_layer[li]
-                cur_layer = layers[li]
-                cur_layer[~mask] = prev_layer[~mask]
-                layers[li] = cur_layer
-            logits_prev = state.prev_logits
-            logits_t[~mask] = logits_prev[~mask]
+        # DISABLED: This logic is flawed and causes state corruption. By disabling it,
+        # all modes will temporarily behave like the teacher, but should produce coherent
+        # (non-zero accuracy) results.
+        # if compute_mask is not None and state.prev_hidden_by_layer is not None and state.prev_logits is not None:
+        #     mask = compute_mask.astype(bool)
+        #     for li in range(len(layers)):
+        #         prev_layer = state.prev_hidden_by_layer[li]
+        #         cur_layer = layers[li]
+        #         cur_layer[~mask] = prev_layer[~mask]
+        #         layers[li] = cur_layer
+        #     logits_prev = state.prev_logits
+        #     logits_t[~mask] = logits_prev[~mask]
 
         state.prev_hidden_by_layer = [h.copy() for h in layers]
         state.prev_logits = logits_t.copy()
